@@ -11,6 +11,9 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -21,18 +24,10 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Check
-        env:
-          RUSTC_WRAPPER: sccache
         run: cargo check --locked --workspace
       - name: Clippy
-        env:
-          RUSTC_WRAPPER: sccache
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Worker WASM Clippy
-        env:
-          RUSTC_WRAPPER: sccache
         run: cargo clippy --locked -p sentinel0-hub-worker --target wasm32-unknown-unknown --all-targets -- -D warnings
       - name: Test
-        env:
-          RUSTC_WRAPPER: sccache
         run: cargo test --locked --workspace
