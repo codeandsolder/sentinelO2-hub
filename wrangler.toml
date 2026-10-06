@@ -1,0 +1,16 @@
+name = "sentinelo2-hub"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-06"
+workers_dev = true
+
+[build]
+command = "worker-build crates/sentinel0-hub-worker --release --out-dir ../../build"
+
+[durable_objects]
+bindings = [
+  { name = "TENANT_HUB", class_name = "TenantHub" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TenantHub"]

@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/sentinel0-hub-core",
+  "crates/sentinel0-hub-native",
+  "crates/sentinel0-hub-worker",
+]
+default-members = [
+  "crates/sentinel0-hub-core",
+  "crates/sentinel0-hub-native",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/codeandsolder/sentinelO2-hub"
+rust-version = "1.99"
+
+[workspace.dependencies]
+axum = { version = "0.8.9", features = ["ws"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+futures-util = "0.3.34"
+http = "1.5.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+uuid = { version = "1.23.0", features = ["serde", "v7"] }
+sentinel0-proto = { git = "https://github.com/codeandsolder/sentinelO2-cloud-core.git", package = "sentinel0-proto" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+unexpected_cfgs = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+too_many_lines = "warn"
+must_use_candidate = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+similar_names = "warn"

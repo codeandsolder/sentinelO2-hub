@@ -1,0 +1,23 @@
+[package]
+name = "sentinel0-hub-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+chrono.workspace = true
+futures-channel = "0.3.34"
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sentinel0-hub-core = { path = "../sentinel0-hub-core" }
+sentinel0-proto.workspace = true
+worker = "0.8.7"
+
+[lints]
+workspace = true

@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: clippy,rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Check
+        env:
+          RUSTC_WRAPPER: sccache
+        run: cargo check --locked --workspace
+      - name: Clippy
+        env:
+          RUSTC_WRAPPER: sccache
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Worker WASM Clippy
+        env:
+          RUSTC_WRAPPER: sccache
+        run: cargo clippy --locked -p sentinel0-hub-worker --target wasm32-unknown-unknown --all-targets -- -D warnings
+      - name: Test
+        env:
+          RUSTC_WRAPPER: sccache
+        run: cargo test --locked --workspace
