@@ -162,7 +162,17 @@ impl DurableObject for TenantHub {
 impl TenantHub {
     fn upgrade_agent(&self, req: &Request) -> Result<Response> {
         let supplied = req.headers().get("authorization")?;
-        let expected = format!("Bearer {}", self.env.secret(AGENT_TOKEN_SECRET)?);
+        let token = match self.env.secret(AGENT_TOKEN_SECRET) {
+            Ok(value) => value.to_string(),
+            Err(_) => {
+                return json_error(
+                    503,
+                    "enrollment_not_configured",
+                    "SENTINEL0_ENROLLMENT_TOKEN is not configured",
+                );
+            }
+        };
+        let expected = format!("Bearer {token}");
         if supplied.as_deref() != Some(expected.as_str()) {
             return json_error(401, "unauthorized", "invalid agent enrollment token");
         }
