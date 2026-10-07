@@ -1,6 +1,6 @@
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension as _, params};
-use sentinel0_hub_core::JobCompletion;
+use sentinel0_hub_core::{HostRecord, HostRegistry, JobCompletion};
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -25,6 +25,8 @@ pub enum StoreError {
     JobHostMismatch,
     #[error("corrupt idempotency row: {0}")]
     CorruptIdempotency(String),
+    #[error("host label is already assigned to {0}")]
+    LabelConflict(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -65,6 +67,22 @@ impl NativeStore {
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;
+             CREATE TABLE IF NOT EXISTS hosts (
+                 host_id TEXT PRIMARY KEY,
+                 hostname TEXT NOT NULL,
+                 label TEXT,
+                 disabled INTEGER NOT NULL DEFAULT 0,
+                 agent_version TEXT NOT NULL DEFAULT '',
+                 protocol_version TEXT NOT NULL DEFAULT '',
+                 last_connected_ms INTEGER NOT NULL DEFAULT 0,
+                 last_disconnected_ms INTEGER
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS hosts_label_unique
+                 ON hosts(label) WHERE label IS NOT NULL;
+             CREATE TABLE IF NOT EXISTS tenant_settings (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS jobs (
                  job_id TEXT PRIMARY KEY,
                  host_id TEXT NOT NULL,
@@ -102,6 +120,126 @@ impl NativeStore {
             params![now_ms],
         )?;
         Ok(Self { connection })
+    }
+
+    pub fn load_host_registry(&self) -> Result<HostRegistry, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT host_id, hostname, label, disabled FROM hosts ORDER BY host_id")?;
+        let hosts = statement
+            .query_map([], |row| {
+                Ok(HostRecord {
+                    host_id: row.get(0)?,
+                    hostname: row.get(1)?,
+                    label: row.get(2)?,
+                    connected: false,
+                    disabled: row.get::<_, i64>(3)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let default_host_id = self
+            .connection
+            .query_row(
+                "SELECT value FROM tenant_settings WHERE key = 'default_host_id' LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(HostRegistry::from_records(hosts, default_host_id))
+    }
+
+    pub fn host_disabled(&self, host_id: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT disabled FROM hosts WHERE host_id = ?1 LIMIT 1",
+                params![host_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|disabled| disabled != 0))
+    }
+
+    pub fn persist_hello(
+        &self,
+        host_id: &str,
+        hostname: &str,
+        agent_version: &str,
+        protocol_version: &str,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO hosts
+                (host_id, hostname, agent_version, protocol_version,
+                 last_connected_ms, last_disconnected_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL)
+             ON CONFLICT(host_id) DO UPDATE SET
+                 hostname = excluded.hostname,
+                 agent_version = excluded.agent_version,
+                 protocol_version = excluded.protocol_version,
+                 last_connected_ms = excluded.last_connected_ms,
+                 last_disconnected_ms = NULL",
+            params![
+                host_id,
+                hostname,
+                agent_version,
+                protocol_version,
+                Utc::now().timestamp_millis()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_host_disconnected(&self, host_id: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE hosts SET last_disconnected_ms = ?1 WHERE host_id = ?2",
+            params![Utc::now().timestamp_millis(), host_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_default_host(&self, host_id: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO tenant_settings (key, value) VALUES ('default_host_id', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![host_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_default_host(&self) -> Result<bool, StoreError> {
+        Ok(self.connection.execute(
+            "DELETE FROM tenant_settings WHERE key = 'default_host_id'",
+            [],
+        )? > 0)
+    }
+
+    pub fn set_host_label(&self, host_id: &str, label: Option<&str>) -> Result<(), StoreError> {
+        if let Some(label) = label {
+            let owner = self
+                .connection
+                .query_row(
+                    "SELECT host_id FROM hosts WHERE label = ?1 AND host_id <> ?2 LIMIT 1",
+                    params![label, host_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(owner) = owner {
+                return Err(StoreError::LabelConflict(owner));
+            }
+        }
+        self.connection.execute(
+            "UPDATE hosts SET label = ?1 WHERE host_id = ?2",
+            params![label, host_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_host_disabled(&self, host_id: &str, disabled: bool) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE hosts SET disabled = ?1 WHERE host_id = ?2",
+            params![disabled, host_id],
+        )?;
+        Ok(())
     }
 
     pub fn begin_idempotency(
@@ -414,6 +552,51 @@ fn query_jobs_by_status(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn host_registry_state_survives_store_reopen() -> Result<(), StoreError> {
+        let path = std::env::temp_dir().join(format!(
+            "sentinel0-hub-native-host-test-{}.sqlite3",
+            uuid::Uuid::now_v7().simple()
+        ));
+        {
+            let store = NativeStore::open(path.to_str().ok_or_else(|| {
+                StoreError::CorruptIdempotency("temporary path is not UTF-8".to_owned())
+            })?)?;
+            store.persist_hello("host_a", "alpha", "1.0", "1.13")?;
+            store.persist_hello("host_b", "beta", "1.0", "1.13")?;
+            store.set_host_label("host_a", Some("build"))?;
+            store.set_host_disabled("host_b", true)?;
+            store.set_default_host("host_a")?;
+        }
+        {
+            let store = NativeStore::open(path.to_str().ok_or_else(|| {
+                StoreError::CorruptIdempotency("temporary path is not UTF-8".to_owned())
+            })?)?;
+            let registry = store.load_host_registry()?;
+            assert_eq!(registry.default_host_id(), Some("host_a"));
+            let hosts = registry.hosts().collect::<Vec<_>>();
+            assert_eq!(hosts.len(), 2);
+            assert!(hosts.iter().all(|host| !host.connected));
+            assert_eq!(
+                hosts
+                    .iter()
+                    .find(|host| host.host_id == "host_a")
+                    .and_then(|host| host.label.as_deref()),
+                Some("build")
+            );
+            assert!(
+                hosts
+                    .iter()
+                    .find(|host| host.host_id == "host_b")
+                    .is_some_and(|host| host.disabled)
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+        Ok(())
+    }
 
     #[test]
     fn idempotency_replays_conflicts_and_tracks_pending() -> Result<(), StoreError> {

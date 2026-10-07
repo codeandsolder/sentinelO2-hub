@@ -11,7 +11,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use chrono::Utc;
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -80,6 +80,23 @@ fn default_notifications_operation() -> String {
     "check".to_owned()
 }
 
+#[derive(Debug, Deserialize)]
+struct SetDefaultRequest {
+    host_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetLabelRequest {
+    host_id: String,
+    label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetDisabledRequest {
+    host_id: String,
+    disabled: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     ok: bool,
@@ -102,12 +119,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_path =
         env::var("SENTINEL0_DB_PATH").unwrap_or_else(|_| "sentinel0-hub.sqlite3".to_owned());
     let store = NativeStore::open(&database_path)?;
+    let registry = store.load_host_registry()?;
 
     let state = AppState {
         hub: Arc::new(Hub {
             enrollment_token,
             api_token,
-            registry: RwLock::new(HostRegistry::default()),
+            registry: RwLock::new(registry),
             sessions: RwLock::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             store: StdMutex::new(store),
@@ -120,6 +138,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/ops/{op}", get(v1_op_info))
         .route("/tools", get(v1_tools))
         .route("/openapi.json", get(v1_openapi))
+        .route("/hosts", get(v1_hosts))
+        .route(
+            "/default-host",
+            get(v1_get_default_host)
+                .put(v1_set_default_host)
+                .delete(v1_clear_default_host),
+        )
+        .route("/hosts/label", put(v1_set_host_label))
+        .route("/hosts/disabled", put(v1_set_host_disabled))
         .route("/notifications", post(v1_notifications))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -220,21 +247,9 @@ async fn serve_agent(state: AppState, socket: WebSocket) {
         warn!("agent sent invalid hello JSON");
         return;
     };
-    let Message::Hello {
-        protocol_version,
-        host,
-        ..
-    } = message
-    else {
-        warn!("agent first message was not hello");
+    let Some(host) = validate_and_persist_hello(&state, message) else {
         return;
     };
-
-    if !protocol_version.starts_with("1.") {
-        warn!(%protocol_version, "incompatible protocol");
-        return;
-    }
-
     let host_id = host.id.clone();
     let session_id = format!("sess_{}", Uuid::now_v7().simple());
     let welcome = Message::Welcome {
@@ -255,13 +270,16 @@ async fn serve_agent(state: AppState, socket: WebSocket) {
 
     state.hub.registry.write().await.register_hello(&host);
     let (tx, mut rx) = mpsc::channel::<WsMessage>(256);
-    state.hub.sessions.write().await.insert(
+    let superseded = state.hub.sessions.write().await.insert(
         host_id.clone(),
         AgentSession {
             session_id: session_id.clone(),
             tx,
         },
     );
+    if let Some(superseded) = superseded {
+        let _ = superseded.tx.send(WsMessage::Close(None)).await;
+    }
 
     info!(%host_id, %session_id, "agent connected");
 
@@ -297,17 +315,63 @@ async fn serve_agent(state: AppState, socket: WebSocket) {
     if is_current {
         sessions.remove(&host_id);
         state.hub.registry.write().await.disconnect(&host_id);
-        if let Err(error) = state
+        let store = state
             .hub
             .store
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .mark_running_jobs_orphaned(&host_id)
-        {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(error) = store.mark_host_disconnected(&host_id) {
+            warn!(%host_id, %error, "failed to persist host disconnect");
+        }
+        if let Err(error) = store.mark_running_jobs_orphaned(&host_id) {
             warn!(%host_id, %error, "failed to mark disconnected jobs orphaned");
         }
     }
     info!(%host_id, %session_id, "agent disconnected");
+}
+
+fn validate_and_persist_hello(
+    state: &AppState,
+    message: Message,
+) -> Option<sentinel0_proto::HostInfo> {
+    let Message::Hello {
+        protocol_version,
+        agent_version,
+        host,
+        ..
+    } = message
+    else {
+        warn!("agent first message was not hello");
+        return None;
+    };
+    if !protocol_version.starts_with("1.") {
+        warn!(%protocol_version, "incompatible protocol");
+        return None;
+    }
+    let store = state
+        .hub
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match store.host_disabled(&host.id) {
+        Ok(true) => {
+            warn!(host_id = %host.id, "disabled host attempted to connect");
+            return None;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            warn!(host_id = %host.id, %error, "failed to inspect host policy");
+            return None;
+        }
+    }
+    if let Err(error) =
+        store.persist_hello(&host.id, &host.hostname, &agent_version, &protocol_version)
+    {
+        warn!(host_id = %host.id, %error, "failed to persist agent hello");
+        return None;
+    }
+    drop(store);
+    Some(*host)
 }
 
 async fn handle_agent_text(state: &AppState, host_id: &str, raw: &str) {
@@ -401,6 +465,222 @@ async fn send_text_to_host(state: &AppState, host_id: &str, text: &str) {
             .send(WsMessage::Text(text.to_owned().into()))
             .await;
     }
+}
+
+async fn v1_hosts(State(state): State<AppState>) -> Response {
+    let registry = state.hub.registry.read().await;
+    let hosts = registry.hosts().cloned().collect::<Vec<_>>();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "hosts": hosts,
+            "default_host_id": registry.default_host_id(),
+        })),
+    )
+        .into_response()
+}
+
+async fn v1_get_default_host(State(state): State<AppState>) -> Response {
+    let registry = state.hub.registry.read().await;
+    let default_host_id = registry.default_host_id();
+    let is_connected = default_host_id.and_then(|host_id| {
+        registry
+            .hosts()
+            .find(|host| host.host_id == host_id)
+            .map(sentinel0_hub_core::HostRecord::eligible)
+    });
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "default_host_id": default_host_id,
+            "is_connected": is_connected,
+        })),
+    )
+        .into_response()
+}
+
+async fn v1_set_default_host(
+    State(state): State<AppState>,
+    Json(request): Json<SetDefaultRequest>,
+) -> Response {
+    let is_connected = {
+        let registry = state.hub.registry.read().await;
+        let Some(host) = registry
+            .hosts()
+            .find(|host| host.host_id == request.host_id)
+        else {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "host_not_found",
+                "unknown host_id".to_owned(),
+            );
+        };
+        host.connected
+    };
+    if let Err(error) = state
+        .hub
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_default_host(&request.host_id)
+    {
+        return store_error_response(&error);
+    }
+    if let Err(error) = state
+        .hub
+        .registry
+        .write()
+        .await
+        .set_default(&request.host_id)
+    {
+        return host_mutation_error(&error);
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "host_id": request.host_id,
+            "is_connected": is_connected,
+        })),
+    )
+        .into_response()
+}
+
+async fn v1_clear_default_host(State(state): State<AppState>) -> Response {
+    let removed = match state
+        .hub
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear_default_host()
+    {
+        Ok(removed) => removed,
+        Err(error) => return store_error_response(&error),
+    };
+    state.hub.registry.write().await.clear_default();
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "removed": removed})),
+    )
+        .into_response()
+}
+
+async fn v1_set_host_label(
+    State(state): State<AppState>,
+    Json(request): Json<SetLabelRequest>,
+) -> Response {
+    let label = request
+        .label
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    {
+        let registry = state.hub.registry.read().await;
+        if !registry.hosts().any(|host| host.host_id == request.host_id) {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "host_not_found",
+                "unknown host_id".to_owned(),
+            );
+        }
+    }
+    if let Err(error) = state
+        .hub
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_host_label(&request.host_id, label.as_deref())
+    {
+        return match error {
+            StoreError::LabelConflict(owner) => api_error(
+                StatusCode::CONFLICT,
+                "label_conflict",
+                format!("label is already assigned to {owner}"),
+            ),
+            other => store_error_response(&other),
+        };
+    }
+    if let Err(error) = state
+        .hub
+        .registry
+        .write()
+        .await
+        .set_label(&request.host_id, label.clone())
+    {
+        return host_mutation_error(&error);
+    }
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "host_id": request.host_id, "label": label})),
+    )
+        .into_response()
+}
+
+async fn v1_set_host_disabled(
+    State(state): State<AppState>,
+    Json(request): Json<SetDisabledRequest>,
+) -> Response {
+    {
+        let registry = state.hub.registry.read().await;
+        if !registry.hosts().any(|host| host.host_id == request.host_id) {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "host_not_found",
+                "unknown host_id".to_owned(),
+            );
+        }
+    }
+    if let Err(error) = state
+        .hub
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_host_disabled(&request.host_id, request.disabled)
+    {
+        return store_error_response(&error);
+    }
+    if let Err(error) = state
+        .hub
+        .registry
+        .write()
+        .await
+        .set_disabled(&request.host_id, request.disabled)
+    {
+        return host_mutation_error(&error);
+    }
+    if request.disabled {
+        state
+            .hub
+            .registry
+            .write()
+            .await
+            .disconnect(&request.host_id);
+        let session = state.hub.sessions.write().await.remove(&request.host_id);
+        if let Some(session) = session {
+            let _ = session.tx.send(WsMessage::Close(None)).await;
+        }
+        let store = state
+            .hub
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(error) = store.mark_host_disconnected(&request.host_id) {
+            warn!(host_id = %request.host_id, %error, "failed to persist disabled host disconnect");
+        }
+        if let Err(error) = store.mark_running_jobs_orphaned(&request.host_id) {
+            warn!(host_id = %request.host_id, %error, "failed to orphan disabled host jobs");
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "host_id": request.host_id,
+            "disabled": request.disabled,
+        })),
+    )
+        .into_response()
 }
 
 async fn v1_op(State(state): State<AppState>, Json(request): Json<OpRequest>) -> Response {
@@ -739,6 +1019,17 @@ fn value_response(status: u16, body: Value) -> Response {
             "store_error",
             "stored idempotency response has invalid HTTP status".to_owned(),
         ),
+    }
+}
+
+fn host_mutation_error(error: &HostResolutionError) -> Response {
+    match error {
+        HostResolutionError::NotFound(_) => api_error(
+            StatusCode::NOT_FOUND,
+            "host_not_found",
+            "unknown host_id".to_owned(),
+        ),
+        other => api_error(StatusCode::BAD_REQUEST, "invalid_host", other.to_string()),
     }
 }
 

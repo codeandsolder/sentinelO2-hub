@@ -141,6 +141,24 @@ impl HostRegistry {
         self.default_host_id = None;
     }
 
+    /// Enable or disable an enrolled host without losing its identity or label.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostResolutionError::NotFound`] when the host ID is unknown.
+    pub fn set_disabled(
+        &mut self,
+        host_id: &str,
+        disabled: bool,
+    ) -> Result<(), HostResolutionError> {
+        let host = self
+            .hosts
+            .get_mut(host_id)
+            .ok_or_else(|| HostResolutionError::NotFound(host_id.to_owned()))?;
+        host.disabled = disabled;
+        Ok(())
+    }
+
     pub fn hosts(&self) -> impl Iterator<Item = &HostRecord> {
         self.hosts.values()
     }
