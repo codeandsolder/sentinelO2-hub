@@ -5,8 +5,9 @@
 use futures_channel::oneshot;
 use futures_util::future::{Either, select};
 use sentinel0_hub_core::{
-    DirectRequestError, DirectRequestInput, HostRecord, HostRegistry, HostResolutionError,
-    normalize_agent_response, prepare_direct_request,
+    DirectRequestError, DirectRequestInput, DirectResponse, HostRecord, HostRegistry,
+    HostResolutionError, JobCompletion, normalize_agent_response, parse_job_completion,
+    prepare_direct_request,
 };
 use sentinel0_proto::{HEARTBEAT_INTERVAL_SECS, Message};
 use serde::{Deserialize, Serialize};
@@ -39,7 +40,9 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_field_names)] // IDs are distinct protocol/session concepts.
 struct SocketAttachment {
+    connection_id: Option<String>,
     host_id: Option<String>,
     session_id: Option<String>,
 }
@@ -68,6 +71,54 @@ struct SetLabelRequest {
 struct SetDisabledRequest {
     host_id: String,
     disabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct NotificationsRequest {
+    operation: String,
+    job_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActiveSessionRow {
+    host_id: String,
+    session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CurrentSessionRow {
+    present: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct JobOwnerRow {
+    host_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RunningJobRow {
+    job_id: String,
+    #[serde(rename = "host")]
+    host_id: String,
+    tool: String,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NotificationRow {
+    notification_id: String,
+    summary_json: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct JobRow {
+    job_id: String,
+    host_id: String,
+    tool: String,
+    status: String,
+    completion_json: Option<String>,
+    created_ms: i64,
+    updated_ms: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +206,10 @@ impl DurableObject for TenantHub {
                 let request = req.json::<SetDisabledRequest>().await?;
                 self.set_host_disabled(&request.host_id, request.disabled)
             }
+            (Method::Post, "/v1/notifications") => {
+                let request = req.json::<NotificationsRequest>().await?;
+                self.notifications(&request)
+            }
             _ => Response::error("not found", 404),
         }
     }
@@ -178,9 +233,7 @@ impl DurableObject for TenantHub {
             }
         };
 
-        let attachment = ws
-            .deserialize_attachment::<SocketAttachment>()?
-            .unwrap_or_default();
+        let attachment = self.resolve_attachment(&ws)?;
 
         if attachment.host_id.is_none() {
             return self.accept_hello(&ws, message);
@@ -206,7 +259,23 @@ impl DurableObject for TenantHub {
             Message::Ping { timestamp } => {
                 ws.send(&Message::Pong { timestamp })?;
             }
-            Message::Event { kind, .. } => {
+            Message::Event { ref kind, .. } => {
+                match parse_job_completion(&message) {
+                    Ok(Some(completion)) => {
+                        if attachment.host_id.as_deref() != Some(completion.host_id.as_str()) {
+                            console_warn!(
+                                "discarding job completion whose host does not match its socket"
+                            );
+                        } else if let Err(error) = self.persist_job_completion(&completion) {
+                            console_warn!(
+                                "failed to persist job completion {}: {error}",
+                                completion.job_id
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => console_warn!("invalid job_completed event: {error}"),
+                }
                 console_log!("agent event: {kind}");
             }
             _ => {}
@@ -222,11 +291,15 @@ impl DurableObject for TenantHub {
         reason: String,
         was_clean: bool,
     ) -> Result<()> {
-        let attachment = ws
-            .deserialize_attachment::<SocketAttachment>()?
-            .unwrap_or_default();
+        let attachment = self.resolve_attachment(&ws)?;
         if let Some(host_id) = attachment.host_id.as_deref() {
-            self.mark_disconnected(host_id)?;
+            let was_current = match attachment.connection_id.as_deref() {
+                Some(connection_id) => self.clear_active_session(host_id, connection_id)?,
+                None => true,
+            };
+            if was_current {
+                self.mark_disconnected(host_id)?;
+            }
         }
         console_log!(
             "agent socket closed host={:?} code={} clean={} reason={}",
@@ -240,9 +313,7 @@ impl DurableObject for TenantHub {
 
     #[allow(clippy::unused_async_trait_impl)] // DurableObject requires async event handlers.
     async fn websocket_error(&self, ws: WebSocket, error: Error) -> Result<()> {
-        let attachment = ws
-            .deserialize_attachment::<SocketAttachment>()?
-            .unwrap_or_default();
+        let attachment = self.resolve_attachment(&ws)?;
         console_warn!("agent socket error host={:?}: {error}", attachment.host_id);
         Ok(())
     }
@@ -316,6 +387,43 @@ impl TenantHub {
             "CREATE INDEX IF NOT EXISTS idempotency_expires_idx ON idempotency(expires_ms)",
             None::<Vec<SqlStorageValue>>,
         )?;
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS active_sessions (\
+                host_id TEXT PRIMARY KEY,\
+                connection_id TEXT NOT NULL UNIQUE,\
+                session_id TEXT NOT NULL,\
+                connected_ms INTEGER NOT NULL\
+            )",
+            None::<Vec<SqlStorageValue>>,
+        )?;
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS jobs (\
+                job_id TEXT PRIMARY KEY,\
+                host_id TEXT NOT NULL,\
+                tool TEXT NOT NULL,\
+                status TEXT NOT NULL,\
+                completion_json TEXT,\
+                created_ms INTEGER NOT NULL,\
+                updated_ms INTEGER NOT NULL\
+            )",
+            None::<Vec<SqlStorageValue>>,
+        )?;
+        sql.exec(
+            "CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status)",
+            None::<Vec<SqlStorageValue>>,
+        )?;
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS notifications (\
+                notification_id TEXT PRIMARY KEY,\
+                kind TEXT NOT NULL,\
+                ref_id TEXT NOT NULL UNIQUE,\
+                summary_json TEXT NOT NULL,\
+                created_ms INTEGER NOT NULL,\
+                read_ms INTEGER,\
+                acked_ms INTEGER\
+            )",
+            None::<Vec<SqlStorageValue>>,
+        )?;
         Ok(())
     }
 
@@ -337,8 +445,11 @@ impl TenantHub {
         }
 
         let pair = WebSocketPair::new()?;
-        pair.server
-            .serialize_attachment(SocketAttachment::default())?;
+        let connection_id = self.next_connection_id();
+        pair.server.serialize_attachment(SocketAttachment {
+            connection_id: Some(connection_id),
+            ..SocketAttachment::default()
+        })?;
         self.state.accept_web_socket(&pair.server);
         Response::from_websocket(pair.client)
     }
@@ -366,13 +477,23 @@ impl TenantHub {
             return Ok(());
         }
 
+        let mut attachment = ws
+            .deserialize_attachment::<SocketAttachment>()?
+            .unwrap_or_default();
+        let connection_id = attachment
+            .connection_id
+            .clone()
+            .unwrap_or_else(|| self.next_connection_id());
+
         self.close_superseded_socket(&host.id)?;
         let session_id = format!("sess_{}_{}", host.id, Date::now().as_millis());
         self.persist_hello(&host.id, &host.hostname, &agent_version, &protocol_version)?;
-        ws.serialize_attachment(SocketAttachment {
-            host_id: Some(host.id.clone()),
-            session_id: Some(session_id.clone()),
-        })?;
+        self.persist_active_session(&host.id, &connection_id, &session_id)?;
+
+        attachment.connection_id = Some(connection_id);
+        attachment.host_id = Some(host.id.clone());
+        attachment.session_id = Some(session_id.clone());
+        ws.serialize_attachment(attachment)?;
         ws.send(&Message::Welcome {
             session_id,
             server_time: chrono::Utc::now(),
@@ -417,6 +538,85 @@ impl TenantHub {
         Ok(())
     }
 
+    fn persist_active_session(
+        &self,
+        host_id: &str,
+        connection_id: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        self.state.storage().sql().exec(
+            "INSERT INTO active_sessions (host_id, connection_id, session_id, connected_ms) \
+             VALUES (?, ?, ?, ?) ON CONFLICT(host_id) DO UPDATE SET \
+                connection_id = excluded.connection_id, \
+                session_id = excluded.session_id, \
+                connected_ms = excluded.connected_ms",
+            vec![
+                host_id.into(),
+                connection_id.into(),
+                session_id.into(),
+                chrono::Utc::now().timestamp_millis().into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn clear_active_session(&self, host_id: &str, connection_id: &str) -> Result<bool> {
+        let cursor = self.state.storage().sql().exec(
+            "DELETE FROM active_sessions WHERE host_id = ? AND connection_id = ?",
+            vec![host_id.into(), connection_id.into()],
+        )?;
+        Ok(cursor.rows_written() > 0)
+    }
+
+    fn resolve_attachment(&self, ws: &WebSocket) -> Result<SocketAttachment> {
+        let mut attachment = ws
+            .deserialize_attachment::<SocketAttachment>()?
+            .unwrap_or_default();
+        if attachment.host_id.is_some() {
+            return Ok(attachment);
+        }
+        let Some(connection_id) = attachment.connection_id.as_deref() else {
+            return Ok(attachment);
+        };
+        let rows = self
+            .state
+            .storage()
+            .sql()
+            .exec(
+                "SELECT host_id, session_id FROM active_sessions \
+                 WHERE connection_id = ? LIMIT 1",
+                vec![connection_id.into()],
+            )?
+            .to_array::<ActiveSessionRow>()?;
+        let Some(row) = rows.first() else {
+            return Ok(attachment);
+        };
+        attachment.host_id = Some(row.host_id.clone());
+        attachment.session_id = Some(row.session_id.clone());
+        ws.serialize_attachment(attachment.clone())?;
+        Ok(attachment)
+    }
+
+    fn socket_is_current(&self, attachment: &SocketAttachment) -> Result<bool> {
+        let (Some(host_id), Some(connection_id)) = (
+            attachment.host_id.as_deref(),
+            attachment.connection_id.as_deref(),
+        ) else {
+            return Ok(attachment.host_id.is_some());
+        };
+        let rows = self
+            .state
+            .storage()
+            .sql()
+            .exec(
+                "SELECT 1 AS present FROM active_sessions \
+                 WHERE host_id = ? AND connection_id = ? LIMIT 1",
+                vec![host_id.into(), connection_id.into()],
+            )?
+            .to_array::<CurrentSessionRow>()?;
+        Ok(rows.first().is_some_and(|row| row.present == 1))
+    }
+
     fn host_disabled(&self, host_id: &str) -> Result<bool> {
         #[derive(Deserialize)]
         struct DisabledRow {
@@ -437,10 +637,10 @@ impl TenantHub {
 
     fn close_superseded_socket(&self, host_id: &str) -> Result<()> {
         for socket in self.state.get_websockets() {
-            let Some(attachment) = socket.deserialize_attachment::<SocketAttachment>()? else {
-                continue;
-            };
-            if attachment.host_id.as_deref() == Some(host_id) {
+            let attachment = self.resolve_attachment(&socket)?;
+            if attachment.host_id.as_deref() == Some(host_id)
+                && self.socket_is_current(&attachment)?
+            {
                 socket.close(Some(1000), Some("superseded by newer session"))?;
             }
         }
@@ -450,7 +650,7 @@ impl TenantHub {
     async fn dispatch_op(&self, request: OpRequest) -> Result<Response> {
         let live = self.live_sockets()?;
         let registry = self.load_registry(&live)?;
-        let prepared = match prepare_direct_request(
+        let mut prepared = match prepare_direct_request(
             &registry,
             DirectRequestInput {
                 op_name: request.op,
@@ -480,6 +680,10 @@ impl TenantHub {
             return Ok(response);
         }
 
+        let background_job_id = prepared.background_requested().then(|| self.next_job_id());
+        if let Some(job_id) = background_job_id.as_deref() {
+            prepared.assign_background_job_id(job_id);
+        }
         let wire = prepared.wire_message(request_id.clone());
         let (tx, rx) = oneshot::channel();
         self.pending.borrow_mut().insert(
@@ -507,28 +711,100 @@ impl TenantHub {
             return json_error(502, "agent_disconnected", &error.to_string());
         }
 
+        let body = match self
+            .await_agent_response(&request_id, prepared.client_request_id.as_deref(), rx)
+            .await?
+        {
+            Ok(body) => body,
+            Err(response) => return Ok(response),
+        };
+        if let Some(job_id) = background_job_id.as_deref()
+            && body.running_job_id() == Some(job_id)
+        {
+            self.persist_job_started(job_id, &prepared.host_id, prepared.op.as_str())?;
+        }
+        Response::from_json(&body)
+    }
+
+    async fn await_agent_response(
+        &self,
+        request_id: &str,
+        client_request_id: Option<&str>,
+        rx: oneshot::Receiver<Message>,
+    ) -> Result<std::result::Result<DirectResponse, Response>> {
         let delay = Delay::from(Duration::from_secs(65));
         let message = match select(rx, delay).await {
             Either::Left((Ok(message), _)) => message,
             Either::Left((Err(_), _)) => {
-                self.pending.borrow_mut().remove(&request_id);
-                return json_error(502, "agent_disconnected", "agent response channel closed");
+                self.pending.borrow_mut().remove(request_id);
+                self.persist_terminal_request_error(
+                    client_request_id,
+                    request_id,
+                    502,
+                    "agent_disconnected",
+                    "agent response channel closed",
+                );
+                return Ok(Err(json_error(
+                    502,
+                    "agent_disconnected",
+                    "agent response channel closed",
+                )?));
             }
             Either::Right(((), _)) => {
-                self.pending.borrow_mut().remove(&request_id);
-                return json_error(504, "timeout", "agent response deadline exceeded");
+                self.pending.borrow_mut().remove(request_id);
+                self.persist_terminal_request_error(
+                    client_request_id,
+                    request_id,
+                    504,
+                    "timeout",
+                    "agent response deadline exceeded",
+                );
+                return Ok(Err(json_error(
+                    504,
+                    "timeout",
+                    "agent response deadline exceeded",
+                )?));
             }
         };
 
-        let Ok(body) = normalize_agent_response(
-            &message,
-            &request_id,
-            prepared.client_request_id.as_deref(),
-            false,
-        ) else {
-            return json_error(502, "invalid_agent_response", "unexpected agent message");
+        if let Ok(body) = normalize_agent_response(&message, request_id, client_request_id, false) {
+            Ok(Ok(body))
+        } else {
+            self.persist_terminal_request_error(
+                client_request_id,
+                request_id,
+                502,
+                "invalid_agent_response",
+                "unexpected agent message",
+            );
+            Ok(Err(json_error(
+                502,
+                "invalid_agent_response",
+                "unexpected agent message",
+            )?))
+        }
+    }
+
+    fn persist_terminal_request_error(
+        &self,
+        client_request_id: Option<&str>,
+        request_id: &str,
+        status: u16,
+        code: &str,
+        message: &str,
+    ) {
+        let Some(client_request_id) = client_request_id else {
+            return;
         };
-        Response::from_json(&body)
+        if let Err(error) = self.complete_idempotency_http_error(
+            client_request_id,
+            request_id,
+            status,
+            code,
+            message,
+        ) {
+            console_warn!("failed to persist terminal request error {request_id}: {error}");
+        }
     }
 
     fn begin_idempotency(
@@ -712,12 +988,187 @@ impl TenantHub {
         Ok(())
     }
 
+    fn persist_job_started(&self, job_id: &str, host_id: &str, tool: &str) -> Result<()> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.state.storage().sql().exec(
+            "INSERT INTO jobs (job_id, host_id, tool, status, completion_json, created_ms, updated_ms) \
+             VALUES (?, ?, ?, 'running', NULL, ?, ?) ON CONFLICT(job_id) DO NOTHING",
+            vec![
+                job_id.into(),
+                host_id.into(),
+                tool.into(),
+                now_ms.into(),
+                now_ms.into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn persist_job_completion(&self, completion: &JobCompletion) -> Result<()> {
+        let sql = self.state.storage().sql();
+        let owners = sql
+            .exec(
+                "SELECT host_id FROM jobs WHERE job_id = ? LIMIT 1",
+                vec![completion.job_id.as_str().into()],
+            )?
+            .to_array::<JobOwnerRow>()?;
+        if owners
+            .first()
+            .is_some_and(|row| row.host_id != completion.host_id)
+        {
+            return Err(Error::RustError(
+                "job completion host does not match existing job owner".to_owned(),
+            ));
+        }
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let completion_json = serde_json::to_string(&completion.data)
+            .map_err(|error| Error::RustError(error.to_string()))?;
+        let summary_json = serde_json::to_string(&completion.summary())
+            .map_err(|error| Error::RustError(error.to_string()))?;
+        sql.exec(
+            "INSERT INTO jobs (job_id, host_id, tool, status, completion_json, created_ms, updated_ms) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(job_id) DO UPDATE SET \
+                tool = excluded.tool, status = excluded.status, \
+                completion_json = excluded.completion_json, updated_ms = excluded.updated_ms \
+             WHERE jobs.host_id = excluded.host_id",
+            vec![
+                completion.job_id.as_str().into(),
+                completion.host_id.as_str().into(),
+                completion.tool.as_str().into(),
+                completion.status.as_str().into(),
+                completion_json.into(),
+                now_ms.into(),
+                now_ms.into(),
+            ],
+        )?;
+        let notification_id = format!("job:{}", completion.job_id);
+        sql.exec(
+            "INSERT INTO notifications (notification_id, kind, ref_id, summary_json, created_ms, read_ms, acked_ms) \
+             VALUES (?, 'job_completed', ?, ?, ?, NULL, NULL) ON CONFLICT(notification_id) DO UPDATE SET \
+                summary_json = excluded.summary_json",
+            vec![
+                notification_id.into(),
+                completion.job_id.as_str().into(),
+                summary_json.into(),
+                now_ms.into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn notifications(&self, request: &NotificationsRequest) -> Result<Response> {
+        match request.operation.as_str() {
+            "check" => self.notifications_check(),
+            "get" => {
+                let Some(job_id) = request.job_id.as_deref() else {
+                    return json_error(400, "missing_job_id", "notifications get requires job_id");
+                };
+                self.notifications_get(job_id)
+            }
+            "ack" => self.notifications_ack(request.job_id.as_deref()),
+            _ => json_error(
+                400,
+                "invalid_operation",
+                "notifications operation must be check, get or ack",
+            ),
+        }
+    }
+
+    fn notifications_check(&self) -> Result<Response> {
+        let sql = self.state.storage().sql();
+        let unread = sql
+            .exec(
+                "SELECT notification_id, summary_json FROM notifications \
+                 WHERE read_ms IS NULL AND acked_ms IS NULL ORDER BY created_ms LIMIT 100",
+                None::<Vec<SqlStorageValue>>,
+            )?
+            .to_array::<NotificationRow>()?;
+        let mut completed = Vec::with_capacity(unread.len());
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        for row in unread {
+            let summary = serde_json::from_str::<Value>(&row.summary_json)
+                .map_err(|error| Error::RustError(error.to_string()))?;
+            completed.push(summary);
+            sql.exec(
+                "UPDATE notifications SET read_ms = ? \
+                 WHERE notification_id = ? AND read_ms IS NULL AND acked_ms IS NULL",
+                vec![now_ms.into(), row.notification_id.into()],
+            )?;
+        }
+        let running = sql
+            .exec(
+                "SELECT job_id, host_id AS host, tool, status FROM jobs \
+                 WHERE status = 'running' ORDER BY created_ms LIMIT 100",
+                None::<Vec<SqlStorageValue>>,
+            )?
+            .to_array::<RunningJobRow>()?;
+        Response::from_json(&json!({
+            "ok": true,
+            "completed": completed,
+            "running": running,
+            "orphaned": [],
+            "broadcasts": [],
+            "answered_reports": [],
+        }))
+    }
+
+    fn notifications_get(&self, job_id: &str) -> Result<Response> {
+        let rows = self
+            .state
+            .storage()
+            .sql()
+            .exec(
+                "SELECT job_id, host_id, tool, status, completion_json, created_ms, updated_ms \
+                 FROM jobs WHERE job_id = ? LIMIT 1",
+                vec![job_id.into()],
+            )?
+            .to_array::<JobRow>()?;
+        let Some(row) = rows.first() else {
+            return json_error(404, "job_not_found", "unknown job_id");
+        };
+        let completion = row
+            .completion_json
+            .as_deref()
+            .map(serde_json::from_str::<Value>)
+            .transpose()
+            .map_err(|error| Error::RustError(error.to_string()))?;
+        Response::from_json(&json!({
+            "ok": true,
+            "job_id": row.job_id,
+            "host": row.host_id,
+            "tool": row.tool,
+            "status": row.status,
+            "completion": completion,
+            "created_ms": row.created_ms,
+            "updated_ms": row.updated_ms,
+        }))
+    }
+
+    fn notifications_ack(&self, job_id: Option<&str>) -> Result<Response> {
+        let sql = self.state.storage().sql();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let cursor = match job_id {
+            None | Some("all") => sql.exec(
+                "UPDATE notifications SET acked_ms = ? WHERE acked_ms IS NULL",
+                vec![now_ms.into()],
+            )?,
+            Some(job_id) => sql.exec(
+                "UPDATE notifications SET acked_ms = ? \
+                 WHERE ref_id = ? AND acked_ms IS NULL",
+                vec![now_ms.into(), job_id.into()],
+            )?,
+        };
+        Response::from_json(&json!({"ok": true, "acked": cursor.rows_written()}))
+    }
+
     fn live_sockets(&self) -> Result<HashMap<String, WebSocket>> {
         let mut sockets = HashMap::new();
         for socket in self.state.get_websockets() {
-            let Some(attachment) = socket.deserialize_attachment::<SocketAttachment>()? else {
+            let attachment = self.resolve_attachment(&socket)?;
+            if !self.socket_is_current(&attachment)? {
                 continue;
-            };
+            }
             let Some(host_id) = attachment.host_id else {
                 continue;
             };
@@ -877,6 +1328,18 @@ impl TenantHub {
         let mut counter = self.request_counter.borrow_mut();
         *counter = counter.wrapping_add(1);
         format!("hreq_{}_{}", Date::now().as_millis(), *counter)
+    }
+
+    fn next_job_id(&self) -> String {
+        let mut counter = self.request_counter.borrow_mut();
+        *counter = counter.wrapping_add(1);
+        format!("job_{:x}_{:x}", Date::now().as_millis(), *counter)
+    }
+
+    fn next_connection_id(&self) -> String {
+        let mut counter = self.request_counter.borrow_mut();
+        *counter = counter.wrapping_add(1);
+        format!("conn_{:x}_{:x}", Date::now().as_millis(), *counter)
     }
 }
 

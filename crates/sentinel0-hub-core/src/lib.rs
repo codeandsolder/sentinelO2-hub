@@ -13,8 +13,10 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use thiserror::Error;
 
+mod jobs;
 mod request;
 
+pub use jobs::{JOB_COMPLETED_EVENT, JobCompletion, JobEventError, parse_job_completion};
 pub use request::{
     DirectRequestError, DirectRequestInput, DirectResponse, DirectResponseError,
     MAX_CLIENT_REQUEST_ID_BYTES, PreparedDirectRequest, normalize_agent_response,
@@ -486,6 +488,38 @@ mod tests {
         );
         assert_eq!(response.hub_request_id, "hreq-1");
         assert_eq!(response.client_request_id.as_deref(), Some("client-1"));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_job_completion_without_losing_full_event_data() -> Result<(), JobEventError> {
+        let message = serde_json::from_value::<sentinel0_proto::Message>(serde_json::json!({
+            "type": "event",
+            "kind": JOB_COMPLETED_EVENT,
+            "data": {
+                "job_id": "job_1",
+                "tool": "exec",
+                "host": "host_a",
+                "status": "succeeded",
+                "output": "full result",
+                "duration_s": 1.25
+            },
+            "timestamp": "2026-10-07T07:00:00Z"
+        }))
+        .map_err(|_| JobEventError::MissingStringField("job_id"))?;
+        let Some(completion) = parse_job_completion(&message)? else {
+            return Err(JobEventError::MissingStringField("job_id"));
+        };
+        assert_eq!(completion.job_id, "job_1");
+        assert_eq!(
+            completion.data.get("output"),
+            Some(&serde_json::json!("full result"))
+        );
+        assert!(completion.summary().get("output").is_none());
+        assert_eq!(
+            completion.summary().get("duration_s"),
+            Some(&serde_json::json!(1.25))
+        );
         Ok(())
     }
 

@@ -33,6 +33,19 @@ pub struct PreparedDirectRequest {
 
 impl PreparedDirectRequest {
     #[must_use]
+    pub fn background_requested(&self) -> bool {
+        self.payload
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    pub fn assign_background_job_id(&mut self, job_id: &str) {
+        self.payload
+            .insert("job_id".to_owned(), Value::String(job_id.to_owned()));
+    }
+
+    #[must_use]
     pub fn wire_message(&self, request_id: String) -> Message {
         Message::Request {
             id: request_id,
@@ -117,6 +130,14 @@ impl DirectResponse {
     pub fn replayed(mut self) -> Self {
         self.replayed = true;
         self
+    }
+
+    #[must_use]
+    pub fn running_job_id(&self) -> Option<&str> {
+        let result = self.result.as_ref()?;
+        (self.ok && result.get("status").and_then(Value::as_str) == Some("running"))
+            .then(|| result.get("job_id").and_then(Value::as_str))
+            .flatten()
     }
 }
 
