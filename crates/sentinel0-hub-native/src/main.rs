@@ -17,8 +17,8 @@ use chrono::Utc;
 use futures_util::{SinkExt as _, StreamExt as _};
 use sentinel0_hub_core::{
     DIRECT_TOOLS, DirectRequestError, DirectRequestInput, HostRegistry, HostResolutionError,
-    direct_rest_openapi, direct_tool_by_op, normalize_agent_response, parse_job_completion,
-    prepare_direct_request,
+    PreparedDirectRequest, direct_rest_openapi, direct_tool_by_op, normalize_agent_response,
+    parse_job_completion, prepare_direct_request,
 };
 use sentinel0_proto::{HEARTBEAT_INTERVAL_SECS, Message};
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,7 @@ use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use store::{NativeStore, StoreError};
+use store::{BeginIdempotency, NativeStore, StoreError};
 
 #[derive(Clone)]
 struct AppState {
@@ -45,7 +45,7 @@ struct Hub {
     api_token: String,
     registry: RwLock<HostRegistry>,
     sessions: RwLock<HashMap<String, AgentSession>>,
-    pending: Mutex<HashMap<String, oneshot::Sender<Message>>>,
+    pending: Mutex<HashMap<String, PendingRequest>>,
     store: StdMutex<NativeStore>,
 }
 
@@ -53,6 +53,11 @@ struct Hub {
 struct AgentSession {
     session_id: String,
     tx: mpsc::Sender<WsMessage>,
+}
+
+struct PendingRequest {
+    waiter: oneshot::Sender<Message>,
+    client_request_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,8 +318,40 @@ async fn handle_agent_text(state: &AppState, host_id: &str, raw: &str) {
 
     match message {
         Message::Response { ref id, .. } => {
-            if let Some(waiter) = state.hub.pending.lock().await.remove(id) {
-                let _ = waiter.send(message);
+            let pending = state.hub.pending.lock().await.remove(id);
+            if let Some(pending) = pending {
+                if let Some(client_request_id) = pending.client_request_id.as_deref()
+                    && let Ok(body) =
+                        normalize_agent_response(&message, id, Some(client_request_id), false)
+                    && let Err(error) = state
+                        .hub
+                        .store
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .complete_idempotency(client_request_id, id, 200, &body)
+                {
+                    warn!(%id, %error, "failed to persist idempotent agent response");
+                }
+                let _ = pending.waiter.send(message);
+            } else {
+                let store = state
+                    .hub
+                    .store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match store.pending_client_request_id(id) {
+                    Ok(Some(client_request_id)) => {
+                        if let Ok(body) =
+                            normalize_agent_response(&message, id, Some(&client_request_id), false)
+                            && let Err(error) =
+                                store.complete_idempotency(&client_request_id, id, 200, &body)
+                        {
+                            warn!(%id, %error, "failed to persist late idempotent response");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => warn!(%id, %error, "failed to inspect late agent response"),
+                }
             }
         }
         Message::Ping { timestamp } => {
@@ -398,6 +435,11 @@ async fn v1_op(State(state): State<AppState>, Json(request): Json<OpRequest>) ->
         );
     };
 
+    let request_id = format!("hreq_{}", Uuid::now_v7().simple());
+    if let Some(response) = begin_native_idempotency(&state, &prepared, &request_id) {
+        return response;
+    }
+
     let background_job_id = prepared
         .background_requested()
         .then(|| format!("job_{}", Uuid::now_v7().simple()));
@@ -405,9 +447,16 @@ async fn v1_op(State(state): State<AppState>, Json(request): Json<OpRequest>) ->
         prepared.assign_background_job_id(job_id);
     }
 
-    let request_id = format!("hreq_{}", Uuid::now_v7().simple());
     let wire = prepared.wire_message(request_id.clone());
     let Ok(text) = serde_json::to_string(&wire) else {
+        persist_terminal_request_error(
+            &state,
+            prepared.client_request_id.as_deref(),
+            &request_id,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "serialization_error",
+            "could not encode agent request",
+        );
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "serialization_error",
@@ -415,30 +464,11 @@ async fn v1_op(State(state): State<AppState>, Json(request): Json<OpRequest>) ->
         );
     };
 
-    let (tx, rx) = oneshot::channel();
-    state
-        .hub
-        .pending
-        .lock()
-        .await
-        .insert(request_id.clone(), tx);
-    if session.tx.send(WsMessage::Text(text.into())).await.is_err() {
-        state.hub.pending.lock().await.remove(&request_id);
-        return api_error(
-            StatusCode::BAD_GATEWAY,
-            "agent_disconnected",
-            "agent disconnected while dispatching".to_owned(),
-        );
-    }
-
-    let response = tokio::time::timeout(Duration::from_secs(65), rx).await;
-    let Ok(Ok(message)) = response else {
-        state.hub.pending.lock().await.remove(&request_id);
-        return api_error(
-            StatusCode::GATEWAY_TIMEOUT,
-            "timeout",
-            "agent response deadline exceeded".to_owned(),
-        );
+    let message = match dispatch_and_wait(&state, &session, &prepared, &request_id, text).await {
+        Ok(message) => message,
+        Err(error) => {
+            return api_error(error.status, error.code, error.message.to_owned());
+        }
     };
     let Ok(response) = normalize_agent_response(
         &message,
@@ -446,6 +476,14 @@ async fn v1_op(State(state): State<AppState>, Json(request): Json<OpRequest>) ->
         prepared.client_request_id.as_deref(),
         false,
     ) else {
+        persist_terminal_request_error(
+            &state,
+            prepared.client_request_id.as_deref(),
+            &request_id,
+            StatusCode::BAD_GATEWAY,
+            "invalid_agent_response",
+            "unexpected agent message",
+        );
         return api_error(
             StatusCode::BAD_GATEWAY,
             "invalid_agent_response",
@@ -466,6 +504,131 @@ async fn v1_op(State(state): State<AppState>, Json(request): Json<OpRequest>) ->
     }
 
     (StatusCode::OK, Json(response)).into_response()
+}
+
+fn begin_native_idempotency(
+    state: &AppState,
+    prepared: &PreparedDirectRequest,
+    request_id: &str,
+) -> Option<Response> {
+    let (Some(client_request_id), Some(fingerprint)) = (
+        prepared.client_request_id.as_deref(),
+        prepared.invocation_fingerprint.as_deref(),
+    ) else {
+        return None;
+    };
+    let begin = state
+        .hub
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .begin_idempotency(client_request_id, fingerprint, request_id);
+    match begin {
+        Ok(BeginIdempotency::Start) => None,
+        Ok(BeginIdempotency::Conflict) => Some(api_error(
+            StatusCode::CONFLICT,
+            "request_id_conflict",
+            "client_request_id was already used for a different invocation".to_owned(),
+        )),
+        Ok(BeginIdempotency::Pending { hub_request_id }) => Some(
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "ok": false,
+                    "error": "request_in_progress",
+                    "message": "the original invocation is still in progress",
+                    "client_request_id": client_request_id,
+                    "hub_request_id": hub_request_id,
+                    "replayed": false,
+                })),
+            )
+                .into_response(),
+        ),
+        Ok(BeginIdempotency::Replay { status, body }) => Some(value_response(status, body)),
+        Err(error) => {
+            warn!(%error, "idempotency storage unavailable");
+            Some(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "idempotency_unavailable",
+                "idempotency storage is unavailable; request was not dispatched".to_owned(),
+            ))
+        }
+    }
+}
+
+struct DispatchFailure {
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+}
+
+async fn dispatch_and_wait(
+    state: &AppState,
+    session: &AgentSession,
+    prepared: &PreparedDirectRequest,
+    request_id: &str,
+    text: String,
+) -> Result<Message, DispatchFailure> {
+    let (tx, rx) = oneshot::channel();
+    state.hub.pending.lock().await.insert(
+        request_id.to_owned(),
+        PendingRequest {
+            waiter: tx,
+            client_request_id: prepared.client_request_id.clone(),
+        },
+    );
+    if session.tx.send(WsMessage::Text(text.into())).await.is_err() {
+        state.hub.pending.lock().await.remove(request_id);
+        persist_terminal_request_error(
+            state,
+            prepared.client_request_id.as_deref(),
+            request_id,
+            StatusCode::BAD_GATEWAY,
+            "agent_disconnected",
+            "agent disconnected while dispatching",
+        );
+        return Err(DispatchFailure {
+            status: StatusCode::BAD_GATEWAY,
+            code: "agent_disconnected",
+            message: "agent disconnected while dispatching",
+        });
+    }
+
+    match tokio::time::timeout(Duration::from_secs(65), rx).await {
+        Ok(Ok(message)) => Ok(message),
+        Ok(Err(_)) => {
+            state.hub.pending.lock().await.remove(request_id);
+            persist_terminal_request_error(
+                state,
+                prepared.client_request_id.as_deref(),
+                request_id,
+                StatusCode::BAD_GATEWAY,
+                "agent_disconnected",
+                "agent response channel closed",
+            );
+            Err(DispatchFailure {
+                status: StatusCode::BAD_GATEWAY,
+                code: "agent_disconnected",
+                message: "agent response channel closed",
+            })
+        }
+        Err(_) => {
+            state.hub.pending.lock().await.remove(request_id);
+            persist_terminal_request_error(
+                state,
+                prepared.client_request_id.as_deref(),
+                request_id,
+                StatusCode::GATEWAY_TIMEOUT,
+                "timeout",
+                "agent response deadline exceeded",
+            );
+            Err(DispatchFailure {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                code: "timeout",
+                message: "agent response deadline exceeded",
+            })
+        }
+    }
 }
 
 async fn v1_notifications(
@@ -534,6 +697,47 @@ async fn v1_notifications(
             StatusCode::BAD_REQUEST,
             "invalid_operation",
             "notifications operation must be check, get or ack".to_owned(),
+        ),
+    }
+}
+
+fn persist_terminal_request_error(
+    state: &AppState,
+    client_request_id: Option<&str>,
+    hub_request_id: &str,
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) {
+    let Some(client_request_id) = client_request_id else {
+        return;
+    };
+    let body = json!({
+        "ok": false,
+        "error": code,
+        "message": message,
+        "client_request_id": client_request_id,
+        "hub_request_id": hub_request_id,
+        "replayed": false,
+    });
+    if let Err(error) = state
+        .hub
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .complete_idempotency(client_request_id, hub_request_id, status.as_u16(), &body)
+    {
+        warn!(%hub_request_id, %error, "failed to persist terminal request error");
+    }
+}
+
+fn value_response(status: u16, body: Value) -> Response {
+    match StatusCode::from_u16(status) {
+        Ok(status) => (status, Json(body)).into_response(),
+        Err(_) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "store_error",
+            "stored idempotency response has invalid HTTP status".to_owned(),
         ),
     }
 }

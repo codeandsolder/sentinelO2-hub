@@ -5,6 +5,16 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
+const IDEMPOTENCY_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
+
+#[derive(Debug, PartialEq)]
+pub enum BeginIdempotency {
+    Start,
+    Conflict,
+    Pending { hub_request_id: String },
+    Replay { status: u16, body: Value },
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error(transparent)]
@@ -13,6 +23,8 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("job completion host does not match existing job owner")]
     JobHostMismatch,
+    #[error("corrupt idempotency row: {0}")]
+    CorruptIdempotency(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -63,6 +75,17 @@ impl NativeStore {
                  updated_ms INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status);
+             CREATE TABLE IF NOT EXISTS idempotency (
+                 client_request_id TEXT PRIMARY KEY,
+                 fingerprint TEXT NOT NULL,
+                 state TEXT NOT NULL CHECK (state IN ('pending', 'complete')),
+                 hub_request_id TEXT NOT NULL UNIQUE,
+                 response_json TEXT,
+                 http_status INTEGER,
+                 created_ms INTEGER NOT NULL,
+                 expires_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idempotency_expires_idx ON idempotency(expires_ms);
              CREATE TABLE IF NOT EXISTS notifications (
                  notification_id TEXT PRIMARY KEY,
                  kind TEXT NOT NULL,
@@ -79,6 +102,125 @@ impl NativeStore {
             params![now_ms],
         )?;
         Ok(Self { connection })
+    }
+
+    pub fn begin_idempotency(
+        &self,
+        client_request_id: &str,
+        fingerprint: &str,
+        hub_request_id: &str,
+    ) -> Result<BeginIdempotency, StoreError> {
+        let now_ms = Utc::now().timestamp_millis();
+        self.connection.execute(
+            "DELETE FROM idempotency WHERE expires_ms <= ?1",
+            params![now_ms],
+        )?;
+
+        let row = self
+            .connection
+            .query_row(
+                "SELECT fingerprint, state, hub_request_id, response_json, http_status
+                 FROM idempotency WHERE client_request_id = ?1 LIMIT 1",
+                params![client_request_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        if let Some((stored_fingerprint, state, stored_request_id, response_json, http_status)) =
+            row
+        {
+            if stored_fingerprint != fingerprint {
+                return Ok(BeginIdempotency::Conflict);
+            }
+            return match state.as_str() {
+                "pending" => Ok(BeginIdempotency::Pending {
+                    hub_request_id: stored_request_id,
+                }),
+                "complete" => {
+                    let response_json = response_json.ok_or_else(|| {
+                        StoreError::CorruptIdempotency(
+                            "complete row has no response_json".to_owned(),
+                        )
+                    })?;
+                    let mut body = serde_json::from_str::<Value>(&response_json)?;
+                    if let Value::Object(values) = &mut body {
+                        values.insert("replayed".to_owned(), Value::Bool(true));
+                    }
+                    let status = http_status
+                        .and_then(|value| u16::try_from(value).ok())
+                        .filter(|value| (100..=599).contains(value))
+                        .ok_or_else(|| {
+                            StoreError::CorruptIdempotency(
+                                "complete row has invalid http_status".to_owned(),
+                            )
+                        })?;
+                    Ok(BeginIdempotency::Replay { status, body })
+                }
+                other => Err(StoreError::CorruptIdempotency(format!(
+                    "unknown state {other:?}"
+                ))),
+            };
+        }
+
+        self.connection.execute(
+            "INSERT INTO idempotency
+                (client_request_id, fingerprint, state, hub_request_id,
+                 response_json, http_status, created_ms, expires_ms)
+             VALUES (?1, ?2, 'pending', ?3, NULL, NULL, ?4, ?5)",
+            params![
+                client_request_id,
+                fingerprint,
+                hub_request_id,
+                now_ms,
+                now_ms + IDEMPOTENCY_TTL_MS
+            ],
+        )?;
+        Ok(BeginIdempotency::Start)
+    }
+
+    pub fn pending_client_request_id(
+        &self,
+        hub_request_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT client_request_id FROM idempotency
+                 WHERE hub_request_id = ?1 AND state = 'pending' LIMIT 1",
+                params![hub_request_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn complete_idempotency<T: Serialize>(
+        &self,
+        client_request_id: &str,
+        hub_request_id: &str,
+        status: u16,
+        body: &T,
+    ) -> Result<(), StoreError> {
+        let response_json = serde_json::to_string(body)?;
+        self.connection.execute(
+            "UPDATE idempotency SET
+                 state = 'complete', response_json = ?1, http_status = ?2
+             WHERE client_request_id = ?3 AND hub_request_id = ?4 AND state = 'pending'",
+            params![
+                response_json,
+                i64::from(status),
+                client_request_id,
+                hub_request_id
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn mark_running_jobs_orphaned(&self, host_id: &str) -> Result<usize, StoreError> {
@@ -272,6 +414,55 @@ fn query_jobs_by_status(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn idempotency_replays_conflicts_and_tracks_pending() -> Result<(), StoreError> {
+        let store = NativeStore::open(":memory:")?;
+        assert_eq!(
+            store.begin_idempotency("client_1", "fingerprint_a", "hreq_1")?,
+            BeginIdempotency::Start
+        );
+        assert_eq!(
+            store.begin_idempotency("client_1", "fingerprint_a", "hreq_2")?,
+            BeginIdempotency::Pending {
+                hub_request_id: "hreq_1".to_owned()
+            }
+        );
+        assert_eq!(
+            store.begin_idempotency("client_1", "fingerprint_b", "hreq_3")?,
+            BeginIdempotency::Conflict
+        );
+        assert_eq!(
+            store.pending_client_request_id("hreq_1")?.as_deref(),
+            Some("client_1")
+        );
+
+        let body = serde_json::json!({
+            "ok": true,
+            "hub_request_id": "hreq_1",
+            "client_request_id": "client_1",
+            "replayed": false,
+            "result": {"value": 7}
+        });
+        store.complete_idempotency("client_1", "hreq_1", 200, &body)?;
+
+        match store.begin_idempotency("client_1", "fingerprint_a", "hreq_4")? {
+            BeginIdempotency::Replay { status, body } => {
+                assert_eq!(status, 200);
+                assert_eq!(body.get("replayed"), Some(&Value::Bool(true)));
+                assert_eq!(
+                    body.get("hub_request_id").and_then(Value::as_str),
+                    Some("hreq_1")
+                );
+            }
+            other => {
+                return Err(StoreError::CorruptIdempotency(format!(
+                    "expected replay, got {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn job_lifecycle_tracks_running_orphaned_and_completed_once() -> Result<(), StoreError> {
