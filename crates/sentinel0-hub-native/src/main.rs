@@ -12,16 +12,14 @@ use axum::{
 };
 use chrono::Utc;
 use futures_util::{SinkExt as _, StreamExt as _};
-use sentinel0_hub_core::{HostRegistry, HostResolutionError, parse_op};
+use sentinel0_hub_core::{
+    DirectRequestError, DirectRequestInput, HostRegistry, HostResolutionError,
+    normalize_agent_response, prepare_direct_request,
+};
 use sentinel0_proto::{HEARTBEAT_INTERVAL_SECS, Message};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{
-    collections::{BTreeMap, HashMap},
-    env,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, env, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -252,51 +250,39 @@ async fn send_text_to_host(state: &AppState, host_id: &str, text: &str) {
 }
 
 async fn v1_op(State(state): State<AppState>, Json(request): Json<OpRequest>) -> Response {
-    let Some(op) = parse_op(&request.op) else {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "unsupported_op",
-            format!("unsupported op {:?}", request.op),
-        );
-    };
-
-    let host_id = {
+    let prepared = {
         let registry = state.hub.registry.read().await;
-        match registry.resolve(request.host_id.as_deref()) {
-            Ok(host) => host.host_id.clone(),
-            Err(error) => return host_error(&error),
+        match prepare_direct_request(
+            &registry,
+            DirectRequestInput {
+                op_name: request.op,
+                host_selector: request.host_id,
+                payload: request.payload,
+                client_request_id: request.client_request_id,
+            },
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => return direct_request_error(&error),
         }
     };
 
-    let session = state.hub.sessions.read().await.get(&host_id).cloned();
+    let session = state
+        .hub
+        .sessions
+        .read()
+        .await
+        .get(&prepared.host_id)
+        .cloned();
     let Some(session) = session else {
         return api_error(
             StatusCode::BAD_GATEWAY,
             "agent_disconnected",
-            format!("host {host_id:?} has no active agent session"),
+            format!("host {:?} has no active agent session", prepared.host_id),
         );
     };
 
     let request_id = format!("hreq_{}", Uuid::now_v7().simple());
-    let payload = match request.payload {
-        Value::Object(values) => values.into_iter().collect::<BTreeMap<_, _>>(),
-        Value::Null => BTreeMap::new(),
-        other => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_payload",
-                format!("payload must be an object, got {other}"),
-            );
-        }
-    };
-
-    let wire = Message::Request {
-        id: request_id.clone(),
-        op,
-        payload,
-        deadline: None,
-        opaque_ref: None,
-    };
+    let wire = prepared.wire_message(request_id.clone());
     let Ok(text) = serde_json::to_string(&wire) else {
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -322,10 +308,7 @@ async fn v1_op(State(state): State<AppState>, Json(request): Json<OpRequest>) ->
     }
 
     let response = tokio::time::timeout(Duration::from_secs(65), rx).await;
-    let Ok(Ok(Message::Response {
-        ok, result, error, ..
-    })) = response
-    else {
+    let Ok(Ok(message)) = response else {
         state.hub.pending.lock().await.remove(&request_id);
         return api_error(
             StatusCode::GATEWAY_TIMEOUT,
@@ -333,24 +316,37 @@ async fn v1_op(State(state): State<AppState>, Json(request): Json<OpRequest>) ->
             "agent response deadline exceeded".to_owned(),
         );
     };
+    let Ok(response) = normalize_agent_response(
+        &message,
+        &request_id,
+        prepared.client_request_id.as_deref(),
+        false,
+    ) else {
+        return api_error(
+            StatusCode::BAD_GATEWAY,
+            "invalid_agent_response",
+            "unexpected agent message".to_owned(),
+        );
+    };
 
-    let mut result = result;
-    if let Some(result) = result.as_mut() {
-        result.remove("_sx_timing");
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+fn direct_request_error(error: &DirectRequestError) -> Response {
+    match error {
+        DirectRequestError::UnsupportedOp(_)
+        | DirectRequestError::InvalidPayload(_)
+        | DirectRequestError::InvalidClientRequestId => {
+            let code = match error {
+                DirectRequestError::UnsupportedOp(_) => "unsupported_op",
+                DirectRequestError::InvalidPayload(_) => "invalid_payload",
+                DirectRequestError::InvalidClientRequestId => "invalid_client_request_id",
+                DirectRequestError::Host(_) => unreachable!("host errors handled separately"),
+            };
+            api_error(StatusCode::BAD_REQUEST, code, error.to_string())
+        }
+        DirectRequestError::Host(host) => host_error(host),
     }
-
-    (
-        StatusCode::OK,
-        Json(json!({
-            "ok": ok,
-            "result": result,
-            "error": error,
-            "hub_request_id": request_id,
-            "client_request_id": request.client_request_id,
-            "replayed": false
-        })),
-    )
-        .into_response()
 }
 
 fn host_error(error: &HostResolutionError) -> Response {

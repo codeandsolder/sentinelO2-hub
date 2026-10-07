@@ -5,16 +5,13 @@
 use futures_channel::oneshot;
 use futures_util::future::{Either, select};
 use sentinel0_hub_core::{
-    HostRecord, HostRegistry, HostResolutionError, invocation_fingerprint, parse_op,
+    DirectRequestError, DirectRequestInput, HostRecord, HostRegistry, HostResolutionError,
+    normalize_agent_response, prepare_direct_request,
 };
 use sentinel0_proto::{HEARTBEAT_INTERVAL_SECS, Message};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{
-    cell::RefCell,
-    collections::{BTreeMap, HashMap},
-    time::Duration,
-};
+use std::{cell::RefCell, collections::HashMap, time::Duration};
 use worker::{
     Context, Date, Delay, DurableObject, Env, Error, Method, Request, Response, Result,
     SqlStorageValue, State, WebSocket, WebSocketIncomingMessage, WebSocketPair, console_log,
@@ -27,7 +24,6 @@ const AGENT_TOKEN_SECRET: &str = "SENTINEL0_ENROLLMENT_TOKEN";
 const API_TOKEN_SECRET: &str = "SENTINEL0_API_TOKEN";
 const DEFAULT_HOST_KEY: &str = "default_host_id";
 const IDEMPOTENCY_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
-const MAX_CLIENT_REQUEST_ID_BYTES: usize = 256;
 
 #[event(fetch, respond_with_errors)]
 /// Route one public Worker request to this deployment's tenant Durable Object.
@@ -452,72 +448,50 @@ impl TenantHub {
     }
 
     async fn dispatch_op(&self, request: OpRequest) -> Result<Response> {
-        let OpRequest {
-            op: op_name,
-            host_id,
-            payload,
-            client_request_id,
-        } = request;
-        let Some(op) = parse_op(&op_name) else {
+        let live = self.live_sockets()?;
+        let registry = self.load_registry(&live)?;
+        let prepared = match prepare_direct_request(
+            &registry,
+            DirectRequestInput {
+                op_name: request.op,
+                host_selector: request.host_id,
+                payload: request.payload,
+                client_request_id: request.client_request_id,
+            },
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => return direct_request_error(&error),
+        };
+        let Some(socket) = live.get(&prepared.host_id).cloned() else {
             return json_error(
-                400,
-                "unsupported_op",
-                &format!("unsupported op {op_name:?}"),
+                502,
+                "agent_disconnected",
+                "resolved agent has no live socket",
             );
         };
 
-        let (resolved_host_id, socket) = match self.resolve_socket(host_id.as_deref())? {
-            Ok(resolved) => resolved,
-            Err(error) => return host_resolution_error(&error),
-        };
-
-        let payload_value = match payload {
-            Value::Object(values) => Value::Object(values),
-            Value::Null => json!({}),
-            other => {
-                return json_error(
-                    400,
-                    "invalid_payload",
-                    &format!("payload must be an object, got {other}"),
-                );
-            }
-        };
-        let Value::Object(payload_object) = &payload_value else {
-            unreachable!("payload was normalized to an object");
-        };
-        let payload = payload_object
-            .clone()
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
-
         let request_id = self.next_request_id();
-        if let Some(client_request_id) = client_request_id.as_deref() {
-            let fingerprint = invocation_fingerprint(op, &resolved_host_id, &payload_value);
-            if let Some(response) =
-                self.begin_idempotency(client_request_id, &fingerprint, &request_id)?
-            {
-                return Ok(response);
-            }
+        if let (Some(client_request_id), Some(fingerprint)) = (
+            prepared.client_request_id.as_deref(),
+            prepared.invocation_fingerprint.as_deref(),
+        ) && let Some(response) =
+            self.begin_idempotency(client_request_id, fingerprint, &request_id)?
+        {
+            return Ok(response);
         }
 
-        let wire = Message::Request {
-            id: request_id.clone(),
-            op,
-            payload,
-            deadline: None,
-            opaque_ref: None,
-        };
+        let wire = prepared.wire_message(request_id.clone());
         let (tx, rx) = oneshot::channel();
         self.pending.borrow_mut().insert(
             request_id.clone(),
             PendingRequest {
                 waiter: tx,
-                client_request_id: client_request_id.clone(),
+                client_request_id: prepared.client_request_id.clone(),
             },
         );
         if let Err(error) = socket.send(&wire) {
             self.pending.borrow_mut().remove(&request_id);
-            if let Some(client_request_id) = client_request_id.as_deref()
+            if let Some(client_request_id) = prepared.client_request_id.as_deref()
                 && let Err(persist_error) = self.complete_idempotency_http_error(
                     client_request_id,
                     &request_id,
@@ -546,9 +520,12 @@ impl TenantHub {
             }
         };
 
-        let Some(body) =
-            agent_response_body(&message, &request_id, client_request_id.as_deref(), false)
-        else {
+        let Ok(body) = normalize_agent_response(
+            &message,
+            &request_id,
+            prepared.client_request_id.as_deref(),
+            false,
+        ) else {
             return json_error(502, "invalid_agent_response", "unexpected agent message");
         };
         Response::from_json(&body)
@@ -560,14 +537,6 @@ impl TenantHub {
         fingerprint: &str,
         request_id: &str,
     ) -> Result<Option<Response>> {
-        if client_request_id.is_empty() || client_request_id.len() > MAX_CLIENT_REQUEST_ID_BYTES {
-            return Ok(Some(json_error(
-                400,
-                "invalid_client_request_id",
-                "client_request_id must contain 1..=256 bytes",
-            )?));
-        }
-
         match self.begin_idempotency_inner(client_request_id, fingerprint, request_id) {
             Ok(response) => Ok(response),
             Err(error) => {
@@ -606,7 +575,7 @@ impl TenantHub {
             if row.fingerprint != fingerprint {
                 return Ok(Some(json_error(
                     409,
-                    "idempotency_conflict",
+                    "request_id_conflict",
                     "client_request_id was already used for a different invocation",
                 )?));
             }
@@ -615,7 +584,7 @@ impl TenantHub {
                 "pending" => Ok(Some(
                     Response::from_json(&json!({
                         "ok": false,
-                        "error": "idempotency_in_progress",
+                        "error": "request_in_progress",
                         "message": "the original invocation is still in progress",
                         "client_request_id": client_request_id,
                         "hub_request_id": row.hub_request_id,
@@ -671,7 +640,8 @@ impl TenantHub {
         client_request_id: &str,
         message: &Message,
     ) -> Result<()> {
-        let Some(body) = agent_response_body(message, request_id, Some(client_request_id), false)
+        let Ok(body) =
+            normalize_agent_response(message, request_id, Some(client_request_id), false)
         else {
             return Ok(());
         };
@@ -692,8 +662,8 @@ impl TenantHub {
         let Some(row) = rows.first() else {
             return Ok(());
         };
-        let Some(body) =
-            agent_response_body(message, request_id, Some(&row.client_request_id), false)
+        let Ok(body) =
+            normalize_agent_response(message, request_id, Some(&row.client_request_id), false)
         else {
             return Ok(());
         };
@@ -719,12 +689,12 @@ impl TenantHub {
         self.complete_idempotency(client_request_id, request_id, status, &body)
     }
 
-    fn complete_idempotency(
+    fn complete_idempotency<T: Serialize>(
         &self,
         client_request_id: &str,
         request_id: &str,
         status: u16,
-        body: &Value,
+        body: &T,
     ) -> Result<()> {
         let response_json =
             serde_json::to_string(body).map_err(|error| Error::RustError(error.to_string()))?;
@@ -790,22 +760,6 @@ impl TenantHub {
             )?
             .to_array::<SettingRow>()?;
         Ok(rows.first().map(|row| row.value.clone()))
-    }
-
-    fn resolve_socket(
-        &self,
-        selector: Option<&str>,
-    ) -> Result<std::result::Result<(String, WebSocket), HostResolutionError>> {
-        let live = self.live_sockets()?;
-        let registry = self.load_registry(&live)?;
-        let host_id = match registry.resolve(selector) {
-            Ok(host) => host.host_id.clone(),
-            Err(error) => return Ok(Err(error)),
-        };
-        match live.get(&host_id) {
-            Some(socket) => Ok(Ok((host_id, socket.clone()))),
-            None => Ok(Err(HostResolutionError::NotFound(host_id))),
-        }
     }
 
     fn list_hosts_response(&self) -> Result<Response> {
@@ -926,30 +880,21 @@ impl TenantHub {
     }
 }
 
-fn agent_response_body(
-    message: &Message,
-    request_id: &str,
-    client_request_id: Option<&str>,
-    replayed: bool,
-) -> Option<Value> {
-    let Message::Response {
-        ok, result, error, ..
-    } = message
-    else {
-        return None;
-    };
-    let mut result = result.clone();
-    if let Some(result) = result.as_mut() {
-        result.remove("_sx_timing");
+fn direct_request_error(error: &DirectRequestError) -> Result<Response> {
+    match error {
+        DirectRequestError::UnsupportedOp(_)
+        | DirectRequestError::InvalidPayload(_)
+        | DirectRequestError::InvalidClientRequestId => {
+            let code = match error {
+                DirectRequestError::UnsupportedOp(_) => "unsupported_op",
+                DirectRequestError::InvalidPayload(_) => "invalid_payload",
+                DirectRequestError::InvalidClientRequestId => "invalid_client_request_id",
+                DirectRequestError::Host(_) => unreachable!("host errors handled separately"),
+            };
+            json_error(400, code, &error.to_string())
+        }
+        DirectRequestError::Host(host) => host_resolution_error(host),
     }
-    Some(json!({
-        "ok": ok,
-        "result": result,
-        "error": error,
-        "hub_request_id": request_id,
-        "client_request_id": client_request_id,
-        "replayed": replayed,
-    }))
 }
 
 fn host_resolution_error(error: &HostResolutionError) -> Result<Response> {

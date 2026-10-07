@@ -13,6 +13,14 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use thiserror::Error;
 
+mod request;
+
+pub use request::{
+    DirectRequestError, DirectRequestInput, DirectResponse, DirectResponseError,
+    MAX_CLIENT_REQUEST_ID_BYTES, PreparedDirectRequest, normalize_agent_response,
+    prepare_direct_request,
+};
+
 /// One enrolled host as understood by the Hub control plane.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostRecord {
@@ -415,6 +423,70 @@ mod tests {
             invocation_fingerprint(Op::Exec, "host_a", &left),
             invocation_fingerprint(Op::Exec, "host_a", &right)
         );
+    }
+
+    #[test]
+    fn direct_request_coordination_canonicalizes_resolved_host_and_payload()
+    -> Result<(), DirectRequestError> {
+        let mut registry = HostRegistry::default();
+        registry.register_hello(&host("host_a", "alpha"));
+        registry.set_label("host_a", Some("build".to_owned()))?;
+
+        let by_label = prepare_direct_request(
+            &registry,
+            DirectRequestInput {
+                op_name: "exec".to_owned(),
+                host_selector: Some("build".to_owned()),
+                payload: serde_json::json!({"b": 2, "a": 1}),
+                client_request_id: Some("req-1".to_owned()),
+            },
+        )?;
+        let by_id = prepare_direct_request(
+            &registry,
+            DirectRequestInput {
+                op_name: "exec".to_owned(),
+                host_selector: Some("host_a".to_owned()),
+                payload: serde_json::json!({"a": 1, "b": 2}),
+                client_request_id: Some("req-1".to_owned()),
+            },
+        )?;
+
+        assert_eq!(by_label.host_id, "host_a");
+        assert_eq!(
+            by_label.invocation_fingerprint,
+            by_id.invocation_fingerprint
+        );
+        assert_eq!(by_label.payload, by_id.payload);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_response_normalization_strips_internal_timing() -> Result<(), DirectResponseError> {
+        let message = sentinel0_proto::Message::Response {
+            id: "wire-1".to_owned(),
+            ok: true,
+            result: Some(BTreeMap::from([
+                (
+                    "_sx_timing".to_owned(),
+                    serde_json::json!({"internal": true}),
+                ),
+                ("response_time".to_owned(), serde_json::json!("12:34:56")),
+            ])),
+            error: None,
+        };
+        let response = normalize_agent_response(&message, "hreq-1", Some("client-1"), false)?;
+
+        let Some(result) = response.result.as_ref() else {
+            return Err(DirectResponseError::UnexpectedMessage);
+        };
+        assert!(!result.contains_key("_sx_timing"));
+        assert_eq!(
+            result.get("response_time"),
+            Some(&serde_json::json!("12:34:56"))
+        );
+        assert_eq!(response.hub_request_id, "hreq-1");
+        assert_eq!(response.client_request_id.as_deref(), Some("client-1"));
+        Ok(())
     }
 
     #[test]
