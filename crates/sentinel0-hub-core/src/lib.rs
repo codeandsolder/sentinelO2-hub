@@ -216,7 +216,7 @@ pub struct DirectTool {
     pub op: Op,
 }
 
-pub const DIRECT_TOOLS: [DirectTool; 27] = [
+pub const DIRECT_TOOLS: [DirectTool; 25] = [
     DirectTool {
         public_name: "sentinel_ping",
         op: Op::Ping,
@@ -260,10 +260,6 @@ pub const DIRECT_TOOLS: [DirectTool; 27] = [
     DirectTool {
         public_name: "sentinel_restart",
         op: Op::Restart,
-    },
-    DirectTool {
-        public_name: "sentinel_service",
-        op: Op::Service,
     },
     DirectTool {
         public_name: "sentinel_upload_init",
@@ -316,10 +312,6 @@ pub const DIRECT_TOOLS: [DirectTool; 27] = [
     DirectTool {
         public_name: "sentinel_chown",
         op: Op::Chown,
-    },
-    DirectTool {
-        public_name: "sentinel_git",
-        op: Op::Git,
     },
     DirectTool {
         public_name: "sentinel_local_api",
@@ -621,14 +613,14 @@ mod tests {
     }
 
     #[test]
-    fn direct_projection_is_exactly_27_unique_ops() {
+    fn direct_projection_matches_current_25_unique_ops() {
         let mut names = DIRECT_TOOLS
             .iter()
             .map(|tool| tool.public_name)
             .collect::<Vec<_>>();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 27);
+        assert_eq!(names.len(), 25);
         assert_eq!(
             direct_tool_by_op("exec").map(|tool| tool.public_name),
             Some("sentinel_exec")
@@ -641,10 +633,12 @@ mod tests {
         assert_eq!(parse_direct_op("exec"), Some(Op::Exec));
         assert_eq!(parse_direct_op("file_export_chunk"), None);
         assert_eq!(parse_direct_op("read_audit"), None);
+        assert_eq!(parse_direct_op("git"), None);
+        assert_eq!(parse_direct_op("service"), None);
         let openapi = direct_rest_openapi();
         let enum_values = &openapi["paths"]["/v1/op"]["post"]["requestBody"]["content"]["application/json"]
             ["schema"]["properties"]["op"]["enum"];
-        assert_eq!(enum_values.as_array().map(Vec::len), Some(27));
+        assert_eq!(enum_values.as_array().map(Vec::len), Some(25));
         assert!(
             !enum_values
                 .as_array()
