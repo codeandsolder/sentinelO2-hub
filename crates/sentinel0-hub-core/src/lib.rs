@@ -338,8 +338,94 @@ pub fn direct_tool_by_public_name(name: &str) -> Option<&'static DirectTool> {
 }
 
 #[must_use]
-pub fn parse_op(name: &str) -> Option<Op> {
-    Op::ALL.into_iter().find(|op| op.as_str() == name)
+pub fn parse_direct_op(name: &str) -> Option<Op> {
+    direct_tool_by_op(name).map(|tool| tool.op)
+}
+
+#[must_use]
+pub fn direct_rest_openapi() -> Value {
+    let op_names = DIRECT_TOOLS
+        .iter()
+        .map(|tool| Value::String(tool.op.as_str().to_owned()))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Sentinel0² Hub API",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "paths": {
+            "/v1/op": {
+                "post": {
+                    "summary": "Dispatch one direct agent operation",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["op"],
+                                    "properties": {
+                                        "op": {"type": "string", "enum": op_names},
+                                        "host_id": {"type": ["string", "null"]},
+                                        "payload": {
+                                            "type": "object",
+                                            "additionalProperties": true,
+                                            "default": {}
+                                        },
+                                        "client_request_id": {
+                                            "type": ["string", "null"],
+                                            "minLength": 1,
+                                            "maxLength": MAX_CLIENT_REQUEST_ID_BYTES
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {"description": "Agent response or accepted background job"},
+                        "400": {"description": "Invalid operation, host selection, or payload"},
+                        "401": {"description": "Authentication failed"},
+                        "404": {"description": "Target host is unavailable"},
+                        "409": {"description": "Idempotency conflict, in-progress request, or offline default"},
+                        "502": {"description": "Agent transport failure"},
+                        "503": {"description": "Required Hub state is unavailable"},
+                        "504": {"description": "Hub response deadline exceeded"}
+                    }
+                }
+            },
+            "/v1/ops": {
+                "get": {
+                    "summary": "List direct operations",
+                    "responses": {"200": {"description": "Direct operation registry"}}
+                }
+            },
+            "/v1/ops/{op}": {
+                "get": {
+                    "summary": "Describe one direct operation",
+                    "parameters": [{
+                        "name": "op",
+                        "in": "path",
+                        "required": true,
+                        "schema": {"type": "string"}
+                    }],
+                    "responses": {
+                        "200": {"description": "Direct operation metadata"},
+                        "404": {"description": "Unsupported direct operation"}
+                    }
+                }
+            },
+            "/v1/tools": {
+                "get": {
+                    "summary": "List direct model-facing tools",
+                    "responses": {"200": {"description": "Direct tool registry"}}
+                }
+            }
+        },
+        "x-sentinel-direct-tools": DIRECT_TOOLS
+    })
 }
 
 /// Canonical request fingerprint used by REST/MCP idempotency.
@@ -552,5 +638,17 @@ mod tests {
             Some(Op::Exec)
         );
         assert!(direct_tool_by_op("nope").is_none());
+        assert_eq!(parse_direct_op("exec"), Some(Op::Exec));
+        assert_eq!(parse_direct_op("file_export_chunk"), None);
+        assert_eq!(parse_direct_op("read_audit"), None);
+        let openapi = direct_rest_openapi();
+        let enum_values = &openapi["paths"]["/v1/op"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["properties"]["op"]["enum"];
+        assert_eq!(enum_values.as_array().map(Vec::len), Some(27));
+        assert!(
+            !enum_values
+                .as_array()
+                .is_some_and(|values| { values.iter().any(|value| value == "file_export_chunk") })
+        );
     }
 }

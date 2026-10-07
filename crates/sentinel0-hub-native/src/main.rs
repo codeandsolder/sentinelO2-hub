@@ -14,7 +14,7 @@ use chrono::Utc;
 use futures_util::{SinkExt as _, StreamExt as _};
 use sentinel0_hub_core::{
     DIRECT_TOOLS, DirectRequestError, DirectRequestInput, HostRegistry, HostResolutionError,
-    direct_tool_by_op, normalize_agent_response, prepare_direct_request,
+    direct_rest_openapi, direct_tool_by_op, normalize_agent_response, prepare_direct_request,
 };
 use sentinel0_proto::{HEARTBEAT_INTERVAL_SECS, Message};
 use serde::{Deserialize, Serialize};
@@ -86,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/ops", get(v1_ops))
         .route("/v1/ops/{op}", get(v1_op_info))
         .route("/v1/tools", get(v1_tools))
+        .route("/v1/openapi.json", get(v1_openapi))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
@@ -104,6 +105,10 @@ async fn v1_ops() -> Json<Value> {
 
 async fn v1_tools() -> Json<Value> {
     Json(json!({"ok": true, "tools": DIRECT_TOOLS}))
+}
+
+async fn v1_openapi() -> Json<Value> {
+    Json(direct_rest_openapi())
 }
 
 async fn v1_op_info(Path(op): Path<String>) -> Response {

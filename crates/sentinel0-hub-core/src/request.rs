@@ -5,7 +5,7 @@
 //! host selection, payload normalization, request-ID validation/fingerprinting,
 //! wire request construction and agent-response normalization.
 
-use crate::{HostRegistry, HostResolutionError, invocation_fingerprint, parse_op};
+use crate::{HostRegistry, HostResolutionError, invocation_fingerprint, parse_direct_op};
 use sentinel0_proto::{Message, Op, ResponseError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -86,7 +86,7 @@ pub fn prepare_direct_request(
         client_request_id,
     } = input;
 
-    let op = parse_op(&op_name).ok_or(DirectRequestError::UnsupportedOp(op_name))?;
+    let op = parse_direct_op(&op_name).ok_or(DirectRequestError::UnsupportedOp(op_name))?;
     if client_request_id
         .as_deref()
         .is_some_and(|id| id.is_empty() || id.len() > MAX_CLIENT_REQUEST_ID_BYTES)

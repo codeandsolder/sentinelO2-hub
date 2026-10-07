@@ -6,8 +6,8 @@ use futures_channel::oneshot;
 use futures_util::future::{Either, select};
 use sentinel0_hub_core::{
     DIRECT_TOOLS, DirectRequestError, DirectRequestInput, DirectResponse, HostRecord, HostRegistry,
-    HostResolutionError, JobCompletion, direct_tool_by_op, normalize_agent_response,
-    parse_job_completion, prepare_direct_request,
+    HostResolutionError, JobCompletion, direct_rest_openapi, direct_tool_by_op,
+    normalize_agent_response, parse_job_completion, prepare_direct_request,
 };
 use sentinel0_proto::{HEARTBEAT_INTERVAL_SECS, Message};
 use serde::{Deserialize, Serialize};
@@ -199,6 +199,7 @@ impl DurableObject for TenantHub {
             }
             (Method::Get, "/v1/ops") => Self::direct_ops_response(),
             (Method::Get, "/v1/tools") => Self::direct_tools_response(),
+            (Method::Get, "/v1/openapi.json") => Response::from_json(&direct_rest_openapi()),
             (Method::Get, "/v1/hosts") => self.list_hosts_response(),
             (Method::Get, "/v1/default-host") => self.default_host_response(),
             (Method::Put, "/v1/default-host") => {
