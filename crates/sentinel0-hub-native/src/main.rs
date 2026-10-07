@@ -1,12 +1,15 @@
 #![forbid(unsafe_code)]
 
+mod store;
+
 use axum::{
     Json, Router,
     extract::{
-        Path, State, WebSocketUpgrade,
+        Path, Request, State, WebSocketUpgrade,
         ws::{Message as WsMessage, WebSocket},
     },
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -14,15 +17,23 @@ use chrono::Utc;
 use futures_util::{SinkExt as _, StreamExt as _};
 use sentinel0_hub_core::{
     DIRECT_TOOLS, DirectRequestError, DirectRequestInput, HostRegistry, HostResolutionError,
-    direct_rest_openapi, direct_tool_by_op, normalize_agent_response, prepare_direct_request,
+    direct_rest_openapi, direct_tool_by_op, normalize_agent_response, parse_job_completion,
+    prepare_direct_request,
 };
 use sentinel0_proto::{HEARTBEAT_INTERVAL_SECS, Message};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashMap, env, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    env,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tracing::{info, warn};
 use uuid::Uuid;
+
+use store::{NativeStore, StoreError};
 
 #[derive(Clone)]
 struct AppState {
@@ -31,9 +42,11 @@ struct AppState {
 
 struct Hub {
     enrollment_token: String,
+    api_token: String,
     registry: RwLock<HostRegistry>,
     sessions: RwLock<HashMap<String, AgentSession>>,
     pending: Mutex<HashMap<String, oneshot::Sender<Message>>>,
+    store: StdMutex<NativeStore>,
 }
 
 #[derive(Clone)]
@@ -49,6 +62,17 @@ struct OpRequest {
     #[serde(default)]
     payload: Value,
     client_request_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NotificationsRequest {
+    #[serde(default = "default_notifications_operation")]
+    operation: String,
+    job_id: Option<String>,
+}
+
+fn default_notifications_operation() -> String {
+    "check".to_owned()
 }
 
 #[derive(Debug, Serialize)]
@@ -68,25 +92,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let enrollment_token = env::var("SENTINEL0_ENROLLMENT_TOKEN")?;
+    let api_token = env::var("SENTINEL0_API_TOKEN")?;
     let listen = env::var("SENTINEL0_LISTEN").unwrap_or_else(|_| "127.0.0.1:8788".to_owned());
+    let database_path =
+        env::var("SENTINEL0_DB_PATH").unwrap_or_else(|_| "sentinel0-hub.sqlite3".to_owned());
+    let store = NativeStore::open(&database_path)?;
 
     let state = AppState {
         hub: Arc::new(Hub {
             enrollment_token,
+            api_token,
             registry: RwLock::new(HostRegistry::default()),
             sessions: RwLock::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            store: StdMutex::new(store),
         }),
     };
+
+    let v1 = Router::new()
+        .route("/op", post(v1_op))
+        .route("/ops", get(v1_ops))
+        .route("/ops/{op}", get(v1_op_info))
+        .route("/tools", get(v1_tools))
+        .route("/openapi.json", get(v1_openapi))
+        .route("/notifications", post(v1_notifications))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_api_auth,
+        ));
 
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/agent/connect", get(agent_connect))
-        .route("/v1/op", post(v1_op))
-        .route("/v1/ops", get(v1_ops))
-        .route("/v1/ops/{op}", get(v1_op_info))
-        .route("/v1/tools", get(v1_tools))
-        .route("/v1/openapi.json", get(v1_openapi))
+        .nest("/v1", v1)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
@@ -97,6 +135,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn healthz() -> Json<Value> {
     Json(json!({"ok": true, "service": "sentinel0-hub-native"}))
+}
+
+async fn require_api_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let expected = format!("Bearer {}", state.hub.api_token);
+    let authorized = request
+        .headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == expected);
+    if !authorized {
+        return api_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "invalid Hub API token".to_owned(),
+        );
+    }
+    next.run(request).await
 }
 
 async fn v1_ops() -> Json<Value> {
@@ -237,6 +292,15 @@ async fn serve_agent(state: AppState, socket: WebSocket) {
     if is_current {
         sessions.remove(&host_id);
         state.hub.registry.write().await.disconnect(&host_id);
+        if let Err(error) = state
+            .hub
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mark_running_jobs_orphaned(&host_id)
+        {
+            warn!(%host_id, %error, "failed to mark disconnected jobs orphaned");
+        }
     }
     info!(%host_id, %session_id, "agent disconnected");
 }
@@ -259,7 +323,33 @@ async fn handle_agent_text(state: &AppState, host_id: &str, raw: &str) {
                 send_text_to_host(state, host_id, &text).await;
             }
         }
-        Message::Event { kind, .. } => {
+        Message::Event { ref kind, .. } => {
+            match parse_job_completion(&message) {
+                Ok(Some(completion)) => {
+                    if completion.host_id != host_id {
+                        warn!(
+                            %host_id,
+                            completion_host = %completion.host_id,
+                            job_id = %completion.job_id,
+                            "discarding job completion whose host does not match its socket"
+                        );
+                    } else if let Err(error) = state
+                        .hub
+                        .store
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .job_completed(&completion)
+                    {
+                        warn!(
+                            job_id = %completion.job_id,
+                            %error,
+                            "failed to persist job completion"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => warn!(%host_id, %error, "invalid job_completed event"),
+            }
             info!(%host_id, %kind, "agent event received");
         }
         _ => {}
@@ -277,7 +367,7 @@ async fn send_text_to_host(state: &AppState, host_id: &str, text: &str) {
 }
 
 async fn v1_op(State(state): State<AppState>, Json(request): Json<OpRequest>) -> Response {
-    let prepared = {
+    let mut prepared = {
         let registry = state.hub.registry.read().await;
         match prepare_direct_request(
             &registry,
@@ -307,6 +397,13 @@ async fn v1_op(State(state): State<AppState>, Json(request): Json<OpRequest>) ->
             format!("host {:?} has no active agent session", prepared.host_id),
         );
     };
+
+    let background_job_id = prepared
+        .background_requested()
+        .then(|| format!("job_{}", Uuid::now_v7().simple()));
+    if let Some(job_id) = background_job_id.as_deref() {
+        prepared.assign_background_job_id(job_id);
+    }
 
     let request_id = format!("hreq_{}", Uuid::now_v7().simple());
     let wire = prepared.wire_message(request_id.clone());
@@ -356,7 +453,89 @@ async fn v1_op(State(state): State<AppState>, Json(request): Json<OpRequest>) ->
         );
     };
 
+    if let Some(job_id) = background_job_id.as_deref()
+        && response.running_job_id() == Some(job_id)
+        && let Err(error) = state
+            .hub
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .job_started(job_id, &prepared.host_id, prepared.op.as_str())
+    {
+        return store_error_response(&error);
+    }
+
     (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn v1_notifications(
+    State(state): State<AppState>,
+    Json(request): Json<NotificationsRequest>,
+) -> Response {
+    let mut store = state
+        .hub
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match request.operation.as_str() {
+        "check" => match store.notifications_check() {
+            Ok(check) => (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "completed": check.completed,
+                    "running": check.running,
+                    "orphaned": check.orphaned,
+                    "broadcasts": [],
+                    "answered_reports": [],
+                })),
+            )
+                .into_response(),
+            Err(error) => store_error_response(&error),
+        },
+        "get" => {
+            let Some(job_id) = request.job_id.as_deref() else {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "missing_job_id",
+                    "notifications get requires job_id".to_owned(),
+                );
+            };
+            match store.notifications_get(job_id) {
+                Ok(Some(job)) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "ok": true,
+                        "job_id": job.job_id,
+                        "host": job.host_id,
+                        "tool": job.tool,
+                        "status": job.status,
+                        "completion": job.completion,
+                        "created_ms": job.created_ms,
+                        "updated_ms": job.updated_ms,
+                    })),
+                )
+                    .into_response(),
+                Ok(None) => api_error(
+                    StatusCode::NOT_FOUND,
+                    "job_not_found",
+                    "unknown job_id".to_owned(),
+                ),
+                Err(error) => store_error_response(&error),
+            }
+        }
+        "ack" => match store.notifications_ack(request.job_id.as_deref()) {
+            Ok(acked) => {
+                (StatusCode::OK, Json(json!({"ok": true, "acked": acked}))).into_response()
+            }
+            Err(error) => store_error_response(&error),
+        },
+        _ => api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_operation",
+            "notifications operation must be check, get or ack".to_owned(),
+        ),
+    }
 }
 
 fn direct_request_error(error: &DirectRequestError) -> Response {
@@ -387,6 +566,14 @@ fn host_error(error: &HostResolutionError) -> Response {
         HostResolutionError::DefaultOffline(_) => (StatusCode::CONFLICT, "default_host_offline"),
     };
     api_error(status, code, error.to_string())
+}
+
+fn store_error_response(error: &StoreError) -> Response {
+    api_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "store_error",
+        error.to_string(),
+    )
 }
 
 fn api_error(status: StatusCode, code: &'static str, message: String) -> Response {
