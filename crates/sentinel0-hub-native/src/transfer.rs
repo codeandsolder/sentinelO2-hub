@@ -33,6 +33,8 @@ pub(super) struct TransferFileRequest {
     overwrite: bool,
     #[serde(default)]
     land_in_place: bool,
+    #[serde(default)]
+    opaque_ref: Option<String>,
 }
 
 struct TransferFailure {
@@ -89,6 +91,17 @@ async fn transfer_file(
     state: &AppState,
     request: &TransferFileRequest,
 ) -> Result<Value, TransferFailure> {
+    if request
+        .opaque_ref
+        .as_deref()
+        .is_some_and(|value| value.chars().count() > 256)
+    {
+        return Err(TransferFailure::transport(
+            StatusCode::BAD_REQUEST,
+            "invalid_opaque_ref",
+            "opaque_ref must be at most 256 characters",
+        ));
+    }
     let (source_host_id, destination_host_id) = {
         let registry = state.hub.registry.read().await;
         let source_host_id = resolve_host(&registry, &request.source_host_id)?;
@@ -131,6 +144,7 @@ async fn transfer_file(
                 Value::from(u64::try_from(TRANSFER_CHUNK_BYTES).unwrap_or(u64::MAX)),
             ),
         ]),
+        request.opaque_ref.as_deref(),
     )
     .await?;
     let plan = parse_export_plan(&init, &transfer_id).map_err(TransferFailure::protocol)?;
@@ -146,7 +160,8 @@ async fn transfer_file(
     )
     .await;
     if result.is_err() {
-        best_effort_export_cleanup(state, &source, &transfer_id).await;
+        best_effort_export_cleanup(state, &source, &transfer_id, request.opaque_ref.as_deref())
+            .await;
     }
     result
 }
@@ -208,6 +223,7 @@ async fn transfer_after_source_init(
             ),
             ("filename".to_owned(), Value::String(plan.filename.clone())),
         ]),
+        request.opaque_ref.as_deref(),
     )
     .await?;
     validate_upload_init(&destination_init, &plan.transfer_id)
@@ -229,6 +245,7 @@ async fn transfer_after_source_init(
             destination,
             plan,
             index,
+            request.opaque_ref.as_deref(),
         )
         .await?;
     }
@@ -241,6 +258,7 @@ async fn transfer_after_source_init(
             "transfer_id".to_owned(),
             Value::String(plan.transfer_id.clone()),
         )]),
+        request.opaque_ref.as_deref(),
     )
     .await?;
     let digest = parse_export_digest(&source_complete, plan).map_err(TransferFailure::protocol)?;
@@ -256,6 +274,7 @@ async fn transfer_after_source_init(
             ),
             ("sha256".to_owned(), Value::String(digest.sha256.clone())),
         ]),
+        request.opaque_ref.as_deref(),
     )
     .await?;
     let upload = parse_upload_result(
@@ -288,8 +307,10 @@ async fn transfer_one_chunk(
     destination: &AgentSession,
     plan: &ExportPlan,
     index: u32,
+    opaque_ref: Option<&str>,
 ) -> Result<(), TransferFailure> {
-    let (binary, chunk) = receive_source_chunk(state, source_host_id, source, plan, index).await?;
+    let (binary, chunk) =
+        receive_source_chunk(state, source_host_id, source, plan, index, opaque_ref).await?;
     forward_destination_chunk(
         state,
         destination_host_id,
@@ -308,6 +329,7 @@ async fn receive_source_chunk(
     source: &AgentSession,
     plan: &ExportPlan,
     index: u32,
+    opaque_ref: Option<&str>,
 ) -> Result<(Vec<u8>, ExportChunkResult), TransferFailure> {
     let key = (source_host_id.to_owned(), plan.transfer_id.clone(), index);
     let (binary_tx, binary_rx) = oneshot::channel();
@@ -329,6 +351,7 @@ async fn receive_source_chunk(
             ),
             ("chunk_index".to_owned(), Value::from(u64::from(index))),
         ]),
+        opaque_ref,
     )
     .await;
     let response = match response {
@@ -482,6 +505,7 @@ async fn internal_request(
     session: &AgentSession,
     op: Op,
     payload: BTreeMap<String, Value>,
+    opaque_ref: Option<&str>,
 ) -> Result<Message, TransferFailure> {
     let request_id = format!("hreq_{}", Uuid::now_v7().simple());
     let wire = Message::Request {
@@ -489,7 +513,7 @@ async fn internal_request(
         op,
         payload,
         deadline: None,
-        opaque_ref: None,
+        opaque_ref: opaque_ref.map(str::to_owned),
     };
     let text = serde_json::to_string(&wire).map_err(|error| {
         TransferFailure::transport(
@@ -537,7 +561,12 @@ async fn internal_request(
     }
 }
 
-async fn best_effort_export_cleanup(state: &AppState, source: &AgentSession, transfer_id: &str) {
+async fn best_effort_export_cleanup(
+    state: &AppState,
+    source: &AgentSession,
+    transfer_id: &str,
+    opaque_ref: Option<&str>,
+) {
     if let Err(error) = internal_request(
         state,
         source,
@@ -546,6 +575,7 @@ async fn best_effort_export_cleanup(state: &AppState, source: &AgentSession, tra
             "transfer_id".to_owned(),
             Value::String(transfer_id.to_owned()),
         )]),
+        opaque_ref,
     )
     .await
     {

@@ -1,13 +1,13 @@
 //! Stateless MCP 2026-07-28 HTTP adapter for the Cloudflare Hub.
 
-use super::{OpRequest, TenantHub};
+use super::{NotificationsRequest, OpRequest, TenantHub};
 use sentinel0_hub_core::{
-    DIRECT_TOOLS, DirectResponse, JSONRPC_METHOD_NOT_FOUND, McpRequest, McpRequestError,
-    mcp_discover_response, mcp_jsonrpc_error, mcp_jsonrpc_result, mcp_tool_error,
-    mcp_tool_result_from_direct, mcp_tools_list_response, parse_mcp_direct_call,
+    DirectResponse, HubToolKind, JSONRPC_METHOD_NOT_FOUND, McpHubCall, McpRequest, McpRequestError,
+    McpToolCall, mcp_discover_response, mcp_jsonrpc_error, mcp_jsonrpc_result, mcp_tool_error,
+    mcp_tool_result_from_direct, mcp_tool_success, mcp_tools_list_response, parse_mcp_tool_call,
     validate_modern_mcp_request,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use worker::{Request, Response, Result};
 
 impl TenantHub {
@@ -39,9 +39,7 @@ impl TenantHub {
 
         match request.method.as_str() {
             "server/discover" => Response::from_json(&mcp_discover_response(&request.id)),
-            "tools/list" => {
-                Response::from_json(&mcp_tools_list_response(&request.id, &DIRECT_TOOLS))
-            }
+            "tools/list" => Response::from_json(&mcp_tools_list_response(&request.id)),
             "tools/call" => self.mcp_call(request).await,
             method => Response::from_json(&mcp_jsonrpc_error(
                 &request.id,
@@ -52,7 +50,7 @@ impl TenantHub {
     }
 
     async fn mcp_call(&self, request: McpRequest) -> Result<Response> {
-        let call = match parse_mcp_direct_call(&request) {
+        let call = match parse_mcp_tool_call(&request) {
             Ok(call) => call,
             Err(error) => {
                 return Response::from_json(&mcp_jsonrpc_result(
@@ -61,17 +59,111 @@ impl TenantHub {
                 ));
             }
         };
-        let response = self
-            .dispatch_op(OpRequest {
-                op: call.op_name,
-                host_id: call.host_selector,
-                payload: call.payload,
-                client_request_id: None,
-            })
-            .await?;
-        let result = direct_response_to_tool_result(response).await;
+        let result = match call {
+            McpToolCall::Direct(call) => {
+                let response = self
+                    .dispatch_op(OpRequest {
+                        op: call.op_name,
+                        host_id: call.host_selector,
+                        payload: call.payload,
+                        client_request_id: None,
+                    })
+                    .await?;
+                direct_response_to_tool_result(response).await
+            }
+            McpToolCall::Hub(call) => self.mcp_hub_call(call).await?,
+        };
         Response::from_json(&mcp_jsonrpc_result(&request.id, result))
     }
+
+    async fn mcp_hub_call(&self, call: McpHubCall) -> Result<Value> {
+        let response = match call.kind {
+            HubToolKind::ListHosts => self.list_hosts_response()?,
+            HubToolKind::GetDefaultHost => self.default_host_response()?,
+            HubToolKind::ClearDefaultHost => self.clear_default_host()?,
+            HubToolKind::SetDefaultHost => {
+                let host_id = match required_string(&call.arguments, "host_id") {
+                    Ok(value) => value,
+                    Err(error) => return Ok(error),
+                };
+                self.set_default_host(&host_id)?
+            }
+            HubToolKind::SetHostLabel => {
+                let host_id = match required_string(&call.arguments, "host_id") {
+                    Ok(value) => value,
+                    Err(error) => return Ok(error),
+                };
+                let label = match required_string(&call.arguments, "label") {
+                    Ok(value) => value,
+                    Err(error) => return Ok(error),
+                };
+                self.set_host_label(&host_id, Some(label))?
+            }
+            HubToolKind::RemoveHostLabel => {
+                return self.mcp_remove_host_label(&call.arguments).await;
+            }
+            HubToolKind::NotificationsCheck => self.notifications(&NotificationsRequest {
+                operation: "check".to_owned(),
+                job_id: None,
+            })?,
+            HubToolKind::NotificationsGet | HubToolKind::NotificationsAck => {
+                let job_id = match required_string(&call.arguments, "job_id") {
+                    Ok(value) => value,
+                    Err(error) => return Ok(error),
+                };
+                let operation = if call.kind == HubToolKind::NotificationsGet {
+                    "get"
+                } else {
+                    "ack"
+                };
+                self.notifications(&NotificationsRequest {
+                    operation: operation.to_owned(),
+                    job_id: Some(job_id),
+                })?
+            }
+            HubToolKind::TransferFile => {
+                let request = match serde_json::from_value::<super::transfer::TransferFileRequest>(
+                    call.arguments,
+                ) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return Ok(mcp_tool_error(
+                            format!("invalid transfer arguments: {error}"),
+                            None,
+                        ));
+                    }
+                };
+                self.transfer_file(request).await?
+            }
+        };
+        Ok(hub_response_to_tool_result(response).await)
+    }
+
+    async fn mcp_remove_host_label(&self, arguments: &Value) -> Result<Value> {
+        let host_id = match required_string(arguments, "host_id") {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        };
+        let live = self.live_sockets()?;
+        let registry = self.load_registry(&live)?;
+        let Some(host) = registry.hosts().find(|host| host.host_id == host_id) else {
+            return Ok(mcp_tool_error("host_not_found: unknown host_id", None));
+        };
+        let removed = host.label.is_some();
+        let response = self.set_host_label(&host_id, None)?;
+        if !(200..300).contains(&response.status_code()) {
+            return Ok(hub_response_to_tool_result(response).await);
+        }
+        Ok(mcp_tool_success(&json!({"ok": true, "removed": removed})))
+    }
+}
+
+fn required_string(arguments: &Value, name: &str) -> std::result::Result<String, Value> {
+    arguments
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| mcp_tool_error(format!("{name} must be a string"), None))
 }
 
 fn modern_request_error(id: &Value, error: &McpRequestError) -> Result<Response> {
@@ -91,25 +183,11 @@ fn modern_request_error(id: &Value, error: &McpRequestError) -> Result<Response>
     .with_status(status))
 }
 
-async fn direct_response_to_tool_result(mut response: Response) -> Value {
+async fn direct_response_to_tool_result(response: Response) -> Value {
     let status = response.status_code();
-    let raw = match response.text().await {
-        Ok(raw) => raw,
-        Err(error) => {
-            return mcp_tool_error(
-                format!("Hub response body could not be read: {error}"),
-                None,
-            );
-        }
-    };
-    let value = match serde_json::from_str::<Value>(&raw) {
+    let value = match response_json(response).await {
         Ok(value) => value,
-        Err(error) => {
-            return mcp_tool_error(
-                format!("Hub returned a non-JSON direct response: {error}"),
-                None,
-            );
-        }
+        Err(error) => return error,
     };
 
     if (200..300).contains(&status) {
@@ -121,7 +199,33 @@ async fn direct_response_to_tool_result(mut response: Response) -> Value {
             ),
         };
     }
+    http_error_to_tool_result(value)
+}
 
+async fn hub_response_to_tool_result(response: Response) -> Value {
+    let status = response.status_code();
+    let value = match response_json(response).await {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if (200..300).contains(&status) {
+        return mcp_tool_success(&value);
+    }
+    http_error_to_tool_result(value)
+}
+
+async fn response_json(mut response: Response) -> std::result::Result<Value, Value> {
+    let raw = response.text().await.map_err(|error| {
+        mcp_tool_error(
+            format!("Hub response body could not be read: {error}"),
+            None,
+        )
+    })?;
+    serde_json::from_str::<Value>(&raw)
+        .map_err(|error| mcp_tool_error(format!("Hub returned a non-JSON response: {error}"), None))
+}
+
+fn http_error_to_tool_result(value: Value) -> Value {
     let code = value
         .get("error")
         .and_then(Value::as_str)

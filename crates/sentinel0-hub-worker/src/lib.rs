@@ -10,7 +10,7 @@ use futures_util::future::{Either, select};
 use sentinel0_hub_core::{
     DIRECT_TOOLS, DirectRequestError, DirectRequestInput, DirectResponse, HostRecord, HostRegistry,
     HostResolutionError, JobCompletion, direct_rest_openapi, direct_tool_by_op,
-    direct_tool_catalog, direct_tool_mcp_entry, normalize_agent_response, parse_job_completion,
+    direct_tool_mcp_entry, model_tool_catalog, normalize_agent_response, parse_job_completion,
     prepare_direct_request,
 };
 use sentinel0_proto::{HEARTBEAT_INTERVAL_SECS, Message};
@@ -1267,7 +1267,7 @@ impl TenantHub {
     }
 
     fn direct_tools_response() -> Result<Response> {
-        Response::from_json(&json!({"ok": true, "tools": direct_tool_catalog(&DIRECT_TOOLS)}))
+        Response::from_json(&json!({"ok": true, "tools": model_tool_catalog()}))
     }
 
     fn direct_op_info_response(op_name: &str) -> Result<Response> {

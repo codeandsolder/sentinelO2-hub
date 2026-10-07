@@ -19,8 +19,8 @@ use chrono::Utc;
 use futures_util::{SinkExt as _, StreamExt as _};
 use sentinel0_hub_core::{
     DIRECT_TOOLS, DirectRequestError, DirectRequestInput, HostRegistry, HostResolutionError,
-    PreparedDirectRequest, direct_rest_openapi, direct_tool_by_op, direct_tool_catalog,
-    direct_tool_mcp_entry, normalize_agent_response, parse_job_completion, prepare_direct_request,
+    PreparedDirectRequest, direct_rest_openapi, direct_tool_by_op, direct_tool_mcp_entry,
+    model_tool_catalog, normalize_agent_response, parse_job_completion, prepare_direct_request,
 };
 use sentinel0_proto::{HEARTBEAT_INTERVAL_SECS, Message};
 use serde::{Deserialize, Serialize};
@@ -207,7 +207,7 @@ async fn v1_ops() -> Json<Value> {
 }
 
 async fn v1_tools() -> Json<Value> {
-    Json(json!({"ok": true, "tools": direct_tool_catalog(&DIRECT_TOOLS)}))
+    Json(json!({"ok": true, "tools": model_tool_catalog()}))
 }
 
 async fn v1_openapi() -> Json<Value> {

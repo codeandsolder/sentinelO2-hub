@@ -1,6 +1,10 @@
 //! Stateless MCP 2026-07-28 HTTP adapter for the native Hub.
 
-use super::{AppState, OpRequest, v1_op};
+use super::{
+    AppState, NotificationsRequest, OpRequest, SetDefaultRequest, SetLabelRequest,
+    v1_clear_default_host, v1_get_default_host, v1_hosts, v1_notifications, v1_op,
+    v1_set_default_host, v1_set_host_label,
+};
 use axum::{
     Json,
     body::{Bytes, to_bytes},
@@ -9,12 +13,12 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use sentinel0_hub_core::{
-    DIRECT_TOOLS, DirectResponse, JSONRPC_METHOD_NOT_FOUND, McpRequest, McpRequestError,
-    mcp_discover_response, mcp_jsonrpc_error, mcp_jsonrpc_result, mcp_tool_error,
-    mcp_tool_result_from_direct, mcp_tools_list_response, parse_mcp_direct_call,
+    DirectResponse, HubToolKind, JSONRPC_METHOD_NOT_FOUND, McpHubCall, McpRequest, McpRequestError,
+    McpToolCall, mcp_discover_response, mcp_jsonrpc_error, mcp_jsonrpc_result, mcp_tool_error,
+    mcp_tool_result_from_direct, mcp_tool_success, mcp_tools_list_response, parse_mcp_tool_call,
     validate_modern_mcp_request,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 const MCP_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
@@ -49,7 +53,7 @@ pub(super) async fn mcp(
 
     match request.method.as_str() {
         "server/discover" => Json(mcp_discover_response(&request.id)).into_response(),
-        "tools/list" => Json(mcp_tools_list_response(&request.id, &DIRECT_TOOLS)).into_response(),
+        "tools/list" => Json(mcp_tools_list_response(&request.id)).into_response(),
         "tools/call" => mcp_call(state, request).await,
         method => Json(mcp_jsonrpc_error(
             &request.id,
@@ -85,7 +89,7 @@ fn modern_request_error(id: &Value, error: &McpRequestError) -> Response {
 }
 
 async fn mcp_call(state: AppState, request: McpRequest) -> Response {
-    let call = match parse_mcp_direct_call(&request) {
+    let call = match parse_mcp_tool_call(&request) {
         Ok(call) => call,
         Err(error) => {
             let result = mcp_tool_error(error.to_string(), None);
@@ -93,39 +97,141 @@ async fn mcp_call(state: AppState, request: McpRequest) -> Response {
         }
     };
 
-    let direct = v1_op(
+    let result = match call {
+        McpToolCall::Direct(call) => {
+            let direct = v1_op(
+                State(state),
+                Json(OpRequest {
+                    op: call.op_name,
+                    host_id: call.host_selector,
+                    payload: call.payload,
+                    client_request_id: None,
+                }),
+            )
+            .await;
+            direct_response_to_tool_result(direct).await
+        }
+        McpToolCall::Hub(call) => mcp_hub_call(state, call).await,
+    };
+    Json(mcp_jsonrpc_result(&request.id, result)).into_response()
+}
+
+async fn mcp_hub_call(state: AppState, call: McpHubCall) -> Value {
+    let response = match call.kind {
+        HubToolKind::ListHosts => v1_hosts(State(state)).await,
+        HubToolKind::GetDefaultHost => v1_get_default_host(State(state)).await,
+        HubToolKind::ClearDefaultHost => v1_clear_default_host(State(state)).await,
+        HubToolKind::SetDefaultHost => {
+            let host_id = match required_string(&call.arguments, "host_id") {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            v1_set_default_host(State(state), Json(SetDefaultRequest { host_id })).await
+        }
+        HubToolKind::SetHostLabel => {
+            let host_id = match required_string(&call.arguments, "host_id") {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let label = match required_string(&call.arguments, "label") {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            v1_set_host_label(
+                State(state),
+                Json(SetLabelRequest {
+                    host_id,
+                    label: Some(label),
+                }),
+            )
+            .await
+        }
+        HubToolKind::RemoveHostLabel => {
+            return remove_host_label(state, &call.arguments).await;
+        }
+        HubToolKind::NotificationsCheck => {
+            v1_notifications(
+                State(state),
+                Json(NotificationsRequest {
+                    operation: "check".to_owned(),
+                    job_id: None,
+                }),
+            )
+            .await
+        }
+        HubToolKind::NotificationsGet | HubToolKind::NotificationsAck => {
+            let job_id = match required_string(&call.arguments, "job_id") {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let operation = if call.kind == HubToolKind::NotificationsGet {
+                "get"
+            } else {
+                "ack"
+            };
+            v1_notifications(
+                State(state),
+                Json(NotificationsRequest {
+                    operation: operation.to_owned(),
+                    job_id: Some(job_id),
+                }),
+            )
+            .await
+        }
+        HubToolKind::TransferFile => {
+            let request = match serde_json::from_value::<super::transfer::TransferFileRequest>(
+                call.arguments,
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    return mcp_tool_error(format!("invalid transfer arguments: {error}"), None);
+                }
+            };
+            super::transfer::v1_transfer_file(State(state), Json(request)).await
+        }
+    };
+    hub_response_to_tool_result(response).await
+}
+
+async fn remove_host_label(state: AppState, arguments: &Value) -> Value {
+    let host_id = match required_string(arguments, "host_id") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let removed = {
+        let registry = state.hub.registry.read().await;
+        let Some(host) = registry.hosts().find(|host| host.host_id == host_id) else {
+            return mcp_tool_error("host_not_found: unknown host_id", None);
+        };
+        host.label.is_some()
+    };
+    let response = v1_set_host_label(
         State(state),
-        Json(OpRequest {
-            op: call.op_name,
-            host_id: call.host_selector,
-            payload: call.payload,
-            client_request_id: None,
+        Json(SetLabelRequest {
+            host_id,
+            label: None,
         }),
     )
     .await;
-    let result = direct_response_to_tool_result(direct).await;
-    Json(mcp_jsonrpc_result(&request.id, result)).into_response()
+    if !response.status().is_success() {
+        return hub_response_to_tool_result(response).await;
+    }
+    mcp_tool_success(&json!({"ok": true, "removed": removed}))
+}
+
+fn required_string(arguments: &Value, name: &str) -> Result<String, Value> {
+    arguments
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| mcp_tool_error(format!("{name} must be a string"), None))
 }
 
 async fn direct_response_to_tool_result(response: Response) -> Value {
     let status = response.status();
-    let bytes = match to_bytes(response.into_body(), MCP_BODY_LIMIT).await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return mcp_tool_error(
-                format!("Hub response body could not be read: {error}"),
-                None,
-            );
-        }
-    };
-    let value = match serde_json::from_slice::<Value>(&bytes) {
+    let value = match response_json(response).await {
         Ok(value) => value,
-        Err(error) => {
-            return mcp_tool_error(
-                format!("Hub returned a non-JSON direct response: {error}"),
-                None,
-            );
-        }
+        Err(error) => return error,
     };
 
     if status.is_success() {
@@ -137,7 +243,35 @@ async fn direct_response_to_tool_result(response: Response) -> Value {
             ),
         };
     }
+    http_error_to_tool_result(value)
+}
 
+async fn hub_response_to_tool_result(response: Response) -> Value {
+    let status = response.status();
+    let value = match response_json(response).await {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if status.is_success() {
+        return mcp_tool_success(&value);
+    }
+    http_error_to_tool_result(value)
+}
+
+async fn response_json(response: Response) -> Result<Value, Value> {
+    let bytes = to_bytes(response.into_body(), MCP_BODY_LIMIT)
+        .await
+        .map_err(|error| {
+            mcp_tool_error(
+                format!("Hub response body could not be read: {error}"),
+                None,
+            )
+        })?;
+    serde_json::from_slice::<Value>(&bytes)
+        .map_err(|error| mcp_tool_error(format!("Hub returned a non-JSON response: {error}"), None))
+}
+
+fn http_error_to_tool_result(value: Value) -> Value {
     let code = value
         .get("error")
         .and_then(Value::as_str)

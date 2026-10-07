@@ -30,6 +30,8 @@ pub(super) struct TransferFileRequest {
     overwrite: bool,
     #[serde(default)]
     land_in_place: bool,
+    #[serde(default)]
+    opaque_ref: Option<String>,
 }
 
 struct TransferFailure {
@@ -80,6 +82,17 @@ impl TenantHub {
         &self,
         request: &TransferFileRequest,
     ) -> std::result::Result<Value, TransferFailure> {
+        if request
+            .opaque_ref
+            .as_deref()
+            .is_some_and(|value| value.chars().count() > 256)
+        {
+            return Err(TransferFailure::new(
+                400,
+                "invalid_opaque_ref",
+                "opaque_ref must be at most 256 characters",
+            ));
+        }
         let live = self.live_sockets().map_err(|error| {
             TransferFailure::new(503, "hub_state_unavailable", error.to_string())
         })?;
@@ -123,6 +136,7 @@ impl TenantHub {
                         Value::from(u64::try_from(TRANSFER_CHUNK_BYTES).unwrap_or(u64::MAX)),
                     ),
                 ]),
+                request.opaque_ref.as_deref(),
             )
             .await?;
         let plan =
@@ -139,8 +153,12 @@ impl TenantHub {
             )
             .await;
         if result.is_err() {
-            self.best_effort_export_cleanup(&source, &plan.transfer_id)
-                .await;
+            self.best_effort_export_cleanup(
+                &source,
+                &plan.transfer_id,
+                request.opaque_ref.as_deref(),
+            )
+            .await;
         }
         result
     }
@@ -176,6 +194,7 @@ impl TenantHub {
                     ),
                     ("filename".to_owned(), Value::String(plan.filename.clone())),
                 ]),
+                request.opaque_ref.as_deref(),
             )
             .await?;
         validate_upload_init(&destination_init, &plan.transfer_id)
@@ -196,6 +215,7 @@ impl TenantHub {
                 destination,
                 plan,
                 index,
+                request.opaque_ref.as_deref(),
             )
             .await?;
         }
@@ -208,6 +228,7 @@ impl TenantHub {
                     "transfer_id".to_owned(),
                     Value::String(plan.transfer_id.clone()),
                 )]),
+                request.opaque_ref.as_deref(),
             )
             .await?;
         let digest =
@@ -224,6 +245,7 @@ impl TenantHub {
                     ),
                     ("sha256".to_owned(), Value::String(digest.sha256.clone())),
                 ]),
+                request.opaque_ref.as_deref(),
             )
             .await?;
         let upload = parse_upload_result(
@@ -256,9 +278,10 @@ impl TenantHub {
         destination: &WebSocket,
         plan: &ExportPlan,
         index: u32,
+        opaque_ref: Option<&str>,
     ) -> std::result::Result<(), TransferFailure> {
         let (binary, chunk) = self
-            .receive_source_chunk(source_host_id, source, plan, index)
+            .receive_source_chunk(source_host_id, source, plan, index, opaque_ref)
             .await?;
         self.forward_destination_chunk(
             destination_host_id,
@@ -277,6 +300,7 @@ impl TenantHub {
         source: &WebSocket,
         plan: &ExportPlan,
         index: u32,
+        opaque_ref: Option<&str>,
     ) -> std::result::Result<(Vec<u8>, ExportChunkResult), TransferFailure> {
         let key = (source_host_id.to_owned(), plan.transfer_id.clone(), index);
         let (binary_tx, binary_rx) = oneshot::channel();
@@ -294,6 +318,7 @@ impl TenantHub {
                     ),
                     ("chunk_index".to_owned(), Value::from(u64::from(index))),
                 ]),
+                opaque_ref,
             )
             .await;
         let response = match response {
@@ -403,6 +428,7 @@ impl TenantHub {
         socket: &WebSocket,
         op: Op,
         payload: BTreeMap<String, Value>,
+        opaque_ref: Option<&str>,
     ) -> std::result::Result<Message, TransferFailure> {
         let request_id = self.next_request_id();
         let wire = Message::Request {
@@ -410,7 +436,7 @@ impl TenantHub {
             op,
             payload,
             deadline: None,
-            opaque_ref: None,
+            opaque_ref: opaque_ref.map(str::to_owned),
         };
         let (tx, rx) = oneshot::channel();
         self.pending.borrow_mut().insert(
@@ -446,7 +472,12 @@ impl TenantHub {
         }
     }
 
-    async fn best_effort_export_cleanup(&self, source: &WebSocket, transfer_id: &str) {
+    async fn best_effort_export_cleanup(
+        &self,
+        source: &WebSocket,
+        transfer_id: &str,
+        opaque_ref: Option<&str>,
+    ) {
         if let Err(error) = self
             .transfer_internal_request(
                 source,
@@ -455,6 +486,7 @@ impl TenantHub {
                     "transfer_id".to_owned(),
                     Value::String(transfer_id.to_owned()),
                 )]),
+                opaque_ref,
             )
             .await
         {

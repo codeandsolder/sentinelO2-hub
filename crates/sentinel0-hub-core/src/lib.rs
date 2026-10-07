@@ -13,18 +13,24 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use thiserror::Error;
 
+mod hub_tools;
 mod jobs;
 mod mcp;
 mod request;
 mod tooling;
 mod transfer;
 
+pub use hub_tools::{
+    HUB_TOOLS, HubTool, HubToolKind, hub_tool_by_public_name, hub_tool_catalog,
+    hub_tool_description, hub_tool_input_schema, hub_tool_mcp_entry, model_tool_catalog,
+};
 pub use jobs::{JOB_COMPLETED_EVENT, JobCompletion, JobEventError, parse_job_completion};
 pub use mcp::{
     JSONRPC_INVALID_PARAMS, JSONRPC_INVALID_REQUEST, JSONRPC_METHOD_NOT_FOUND, MCP_HEADER_MISMATCH,
-    MCP_PROTOCOL_VERSION, McpDirectCall, McpRequest, McpRequestError, mcp_discover_response,
-    mcp_jsonrpc_error, mcp_jsonrpc_result, mcp_response_meta, mcp_server_info, mcp_tool_error,
-    mcp_tool_result_from_direct, mcp_tool_success, mcp_tools_list_response, parse_mcp_direct_call,
+    MCP_PROTOCOL_VERSION, McpDirectCall, McpHubCall, McpRequest, McpRequestError, McpToolCall,
+    mcp_discover_response, mcp_jsonrpc_error, mcp_jsonrpc_result, mcp_response_meta,
+    mcp_server_info, mcp_tool_error, mcp_tool_result_from_direct, mcp_tool_success,
+    mcp_tools_list_response, parse_mcp_direct_call, parse_mcp_tool_call,
     validate_modern_mcp_request,
 };
 pub use request::{

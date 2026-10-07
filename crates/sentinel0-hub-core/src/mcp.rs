@@ -1,6 +1,9 @@
 //! Stateless MCP 2026-07-28 wire helpers shared by Hub adapters.
 
-use crate::{DirectResponse, DirectTool, direct_tool_by_public_name, direct_tool_catalog};
+use crate::{
+    DirectResponse, HubToolKind, direct_tool_by_public_name, hub_tool_by_public_name,
+    model_tool_catalog,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
@@ -26,6 +29,19 @@ pub struct McpDirectCall {
     pub op_name: String,
     pub host_selector: Option<String>,
     pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpHubCall {
+    pub tool_name: String,
+    pub kind: HubToolKind,
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum McpToolCall {
+    Direct(McpDirectCall),
+    Hub(McpHubCall),
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -124,11 +140,11 @@ pub fn mcp_discover_response(id: &Value) -> Value {
 }
 
 #[must_use]
-pub fn mcp_tools_list_response(id: &Value, tools: &[DirectTool]) -> Value {
+pub fn mcp_tools_list_response(id: &Value) -> Value {
     mcp_jsonrpc_result(
         id,
         json!({
-            "tools": direct_tool_catalog(tools),
+            "tools": model_tool_catalog(),
             "ttlMs": 0,
             "cacheScope": "private"
         }),
@@ -177,11 +193,11 @@ pub fn validate_modern_mcp_request(
     Ok(())
 }
 
-/// Convert one model-facing direct tool call into the existing REST/direct request shape.
+/// Convert one model-facing tool call into either a direct-agent invocation or a Hub composition.
 ///
 /// # Errors
 /// Returns an MCP parameter/tool error before any host operation is dispatched.
-pub fn parse_mcp_direct_call(request: &McpRequest) -> Result<McpDirectCall, McpRequestError> {
+pub fn parse_mcp_tool_call(request: &McpRequest) -> Result<McpToolCall, McpRequestError> {
     if request.method != "tools/call" {
         return Err(McpRequestError::MethodNotFound(request.method.clone()));
     }
@@ -193,24 +209,46 @@ pub fn parse_mcp_direct_call(request: &McpRequest) -> Result<McpDirectCall, McpR
         .get("name")
         .and_then(Value::as_str)
         .ok_or(McpRequestError::MissingToolName)?;
-    let tool = direct_tool_by_public_name(tool_name)
-        .ok_or_else(|| McpRequestError::UnknownTool(tool_name.to_owned()))?;
     let mut arguments = match params.get("arguments") {
         None | Some(Value::Null) => Map::new(),
         Some(Value::Object(values)) => values.clone(),
         Some(_) => return Err(McpRequestError::InvalidToolArguments),
     };
-    let host_selector = match arguments.remove("host_id") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(value)) => Some(value),
-        Some(_) => return Err(McpRequestError::InvalidHostSelector),
-    };
-    Ok(McpDirectCall {
-        tool_name: tool_name.to_owned(),
-        op_name: tool.op.as_str().to_owned(),
-        host_selector,
-        payload: Value::Object(arguments),
-    })
+
+    if let Some(tool) = direct_tool_by_public_name(tool_name) {
+        let host_selector = match arguments.remove("host_id") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) => Some(value),
+            Some(_) => return Err(McpRequestError::InvalidHostSelector),
+        };
+        return Ok(McpToolCall::Direct(McpDirectCall {
+            tool_name: tool_name.to_owned(),
+            op_name: tool.op.as_str().to_owned(),
+            host_selector,
+            payload: Value::Object(arguments),
+        }));
+    }
+
+    if let Some(tool) = hub_tool_by_public_name(tool_name) {
+        return Ok(McpToolCall::Hub(McpHubCall {
+            tool_name: tool_name.to_owned(),
+            kind: tool.kind,
+            arguments: Value::Object(arguments),
+        }));
+    }
+
+    Err(McpRequestError::UnknownTool(tool_name.to_owned()))
+}
+
+/// Parse only a direct-agent MCP tool call.
+///
+/// # Errors
+/// Returns [`McpRequestError::UnknownTool`] for Hub compositions or unknown names.
+pub fn parse_mcp_direct_call(request: &McpRequest) -> Result<McpDirectCall, McpRequestError> {
+    match parse_mcp_tool_call(request)? {
+        McpToolCall::Direct(call) => Ok(call),
+        McpToolCall::Hub(call) => Err(McpRequestError::UnknownTool(call.tool_name)),
+    }
 }
 
 #[must_use]
@@ -346,14 +384,14 @@ mod tests {
     #[test]
     fn tools_list_is_modern_cacheable_result() {
         let id = json!(7);
-        let response = mcp_tools_list_response(&id, &DIRECT_TOOLS);
+        let response = mcp_tools_list_response(&id);
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["result"]["resultType"], "complete");
         assert_eq!(response["result"]["ttlMs"], 0);
         assert_eq!(response["result"]["cacheScope"], "private");
         assert_eq!(
             response["result"]["tools"].as_array().map(Vec::len),
-            Some(25)
+            Some(DIRECT_TOOLS.len() + crate::HUB_TOOLS.len())
         );
     }
 
