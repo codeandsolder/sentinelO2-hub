@@ -48,9 +48,30 @@ pub enum HostResolutionError {
     NoEligibleHost,
     #[error("multiple eligible hosts are connected and no default resolves")]
     AmbiguousDefault,
+    #[error("default host {0:?} is not currently eligible")]
+    DefaultOffline(String),
 }
 
 impl HostRegistry {
+    #[must_use]
+    pub fn from_records(
+        hosts: impl IntoIterator<Item = HostRecord>,
+        default_host_id: Option<String>,
+    ) -> Self {
+        Self {
+            hosts: hosts
+                .into_iter()
+                .map(|host| (host.host_id.clone(), host))
+                .collect(),
+            default_host_id,
+        }
+    }
+
+    #[must_use]
+    pub fn default_host_id(&self) -> Option<&str> {
+        self.default_host_id.as_deref()
+    }
+
     /// Insert or refresh host metadata from a successful agent hello.
     pub fn register_hello(&mut self, host: &HostInfo) -> &HostRecord {
         let host_id = host.id.clone();
@@ -153,13 +174,15 @@ impl HostRegistry {
             };
         }
 
-        if let Some(default) = self
-            .default_host_id
-            .as_deref()
-            .and_then(|host_id| self.hosts.get(host_id))
-            .filter(|host| host.eligible())
-        {
-            return Ok(default);
+        if let Some(default_host_id) = self.default_host_id.as_deref() {
+            if let Some(default) = self.hosts.get(default_host_id)
+                && default.eligible()
+            {
+                return Ok(default);
+            }
+            return Err(HostResolutionError::DefaultOffline(
+                default_host_id.to_owned(),
+            ));
         }
 
         let eligible = self
@@ -366,6 +389,21 @@ mod tests {
         assert_eq!(registry.resolve(Some("build"))?.host_id, "host_b");
         assert_eq!(registry.resolve(Some("beta"))?.host_id, "host_b");
         assert_eq!(registry.resolve(None)?.host_id, "host_a");
+        Ok(())
+    }
+
+    #[test]
+    fn offline_default_does_not_silently_fall_back() -> Result<(), HostResolutionError> {
+        let mut registry = HostRegistry::default();
+        registry.register_hello(&host("host_a", "alpha"));
+        registry.register_hello(&host("host_b", "beta"));
+        registry.set_default("host_a")?;
+        registry.disconnect("host_a");
+
+        assert_eq!(
+            registry.resolve(None),
+            Err(HostResolutionError::DefaultOffline("host_a".to_owned()))
+        );
         Ok(())
     }
 

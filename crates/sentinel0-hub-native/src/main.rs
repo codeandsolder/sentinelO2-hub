@@ -361,6 +361,7 @@ fn host_error(error: &HostResolutionError) -> Response {
         HostResolutionError::Ambiguous(_) | HostResolutionError::AmbiguousDefault => {
             (StatusCode::BAD_REQUEST, "ambiguous_host")
         }
+        HostResolutionError::DefaultOffline(_) => (StatusCode::CONFLICT, "default_host_offline"),
     };
     api_error(status, code, error.to_string())
 }
