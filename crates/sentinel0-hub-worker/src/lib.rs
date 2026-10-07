@@ -4,7 +4,9 @@
 
 use futures_channel::oneshot;
 use futures_util::future::{Either, select};
-use sentinel0_hub_core::{HostRecord, HostRegistry, HostResolutionError, parse_op};
+use sentinel0_hub_core::{
+    HostRecord, HostRegistry, HostResolutionError, invocation_fingerprint, parse_op,
+};
 use sentinel0_proto::{HEARTBEAT_INTERVAL_SECS, Message};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -24,6 +26,8 @@ const DEFAULT_TENANT: &str = "default";
 const AGENT_TOKEN_SECRET: &str = "SENTINEL0_ENROLLMENT_TOKEN";
 const API_TOKEN_SECRET: &str = "SENTINEL0_API_TOKEN";
 const DEFAULT_HOST_KEY: &str = "default_host_id";
+const IDEMPOTENCY_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
+const MAX_CLIENT_REQUEST_ID_BYTES: usize = 256;
 
 #[event(fetch, respond_with_errors)]
 /// Route one public Worker request to this deployment's tenant Durable Object.
@@ -83,11 +87,30 @@ struct SettingRow {
     value: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct IdempotencyRow {
+    fingerprint: String,
+    state: String,
+    hub_request_id: String,
+    response_json: Option<String>,
+    http_status: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdempotencyRequestRow {
+    client_request_id: String,
+}
+
+struct PendingRequest {
+    waiter: oneshot::Sender<Message>,
+    client_request_id: Option<String>,
+}
+
 #[durable_object]
 pub struct TenantHub {
     state: State,
     env: Env,
-    pending: RefCell<HashMap<String, oneshot::Sender<Message>>>,
+    pending: RefCell<HashMap<String, PendingRequest>>,
     request_counter: RefCell<u64>,
 }
 
@@ -169,8 +192,19 @@ impl DurableObject for TenantHub {
 
         match message {
             Message::Response { ref id, .. } => {
-                if let Some(waiter) = self.pending.borrow_mut().remove(id) {
-                    let _ = waiter.send(message);
+                if let Some(pending) = self.pending.borrow_mut().remove(id) {
+                    if let Some(client_request_id) = pending.client_request_id.as_deref()
+                        && let Err(error) = self.persist_idempotent_agent_response_for_client(
+                            id,
+                            client_request_id,
+                            &message,
+                        )
+                    {
+                        console_warn!("failed to persist idempotent response {id}: {error}");
+                    }
+                    let _ = pending.waiter.send(message);
+                } else if let Err(error) = self.persist_idempotent_agent_response(id, &message) {
+                    console_warn!("failed to persist late idempotent response {id}: {error}");
                 }
             }
             Message::Ping { timestamp } => {
@@ -267,6 +301,23 @@ impl TenantHub {
                 key TEXT PRIMARY KEY,\
                 value TEXT NOT NULL\
             )",
+            None::<Vec<SqlStorageValue>>,
+        )?;
+        sql.exec(
+            "CREATE TABLE IF NOT EXISTS idempotency (\
+                client_request_id TEXT PRIMARY KEY,\
+                fingerprint TEXT NOT NULL,\
+                state TEXT NOT NULL CHECK (state IN ('pending', 'complete')),\
+                hub_request_id TEXT NOT NULL UNIQUE,\
+                response_json TEXT,\
+                http_status INTEGER,\
+                created_ms INTEGER NOT NULL,\
+                expires_ms INTEGER NOT NULL\
+            )",
+            None::<Vec<SqlStorageValue>>,
+        )?;
+        sql.exec(
+            "CREATE INDEX IF NOT EXISTS idempotency_expires_idx ON idempotency(expires_ms)",
             None::<Vec<SqlStorageValue>>,
         )?;
         Ok(())
@@ -401,22 +452,28 @@ impl TenantHub {
     }
 
     async fn dispatch_op(&self, request: OpRequest) -> Result<Response> {
-        let Some(op) = parse_op(&request.op) else {
+        let OpRequest {
+            op: op_name,
+            host_id,
+            payload,
+            client_request_id,
+        } = request;
+        let Some(op) = parse_op(&op_name) else {
             return json_error(
                 400,
                 "unsupported_op",
-                &format!("unsupported op {:?}", request.op),
+                &format!("unsupported op {op_name:?}"),
             );
         };
 
-        let socket = match self.resolve_socket(request.host_id.as_deref())? {
-            Ok(socket) => socket,
+        let (resolved_host_id, socket) = match self.resolve_socket(host_id.as_deref())? {
+            Ok(resolved) => resolved,
             Err(error) => return host_resolution_error(&error),
         };
 
-        let payload = match request.payload {
-            Value::Object(values) => values.into_iter().collect(),
-            Value::Null => BTreeMap::default(),
+        let payload_value = match payload {
+            Value::Object(values) => Value::Object(values),
+            Value::Null => json!({}),
             other => {
                 return json_error(
                     400,
@@ -425,8 +482,24 @@ impl TenantHub {
                 );
             }
         };
+        let Value::Object(payload_object) = &payload_value else {
+            unreachable!("payload was normalized to an object");
+        };
+        let payload = payload_object
+            .clone()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
 
         let request_id = self.next_request_id();
+        if let Some(client_request_id) = client_request_id.as_deref() {
+            let fingerprint = invocation_fingerprint(op, &resolved_host_id, &payload_value);
+            if let Some(response) =
+                self.begin_idempotency(client_request_id, &fingerprint, &request_id)?
+            {
+                return Ok(response);
+            }
+        }
+
         let wire = Message::Request {
             id: request_id.clone(),
             op,
@@ -435,9 +508,28 @@ impl TenantHub {
             opaque_ref: None,
         };
         let (tx, rx) = oneshot::channel();
-        self.pending.borrow_mut().insert(request_id.clone(), tx);
+        self.pending.borrow_mut().insert(
+            request_id.clone(),
+            PendingRequest {
+                waiter: tx,
+                client_request_id: client_request_id.clone(),
+            },
+        );
         if let Err(error) = socket.send(&wire) {
             self.pending.borrow_mut().remove(&request_id);
+            if let Some(client_request_id) = client_request_id.as_deref()
+                && let Err(persist_error) = self.complete_idempotency_http_error(
+                    client_request_id,
+                    &request_id,
+                    502,
+                    "agent_disconnected",
+                    &error.to_string(),
+                )
+            {
+                console_warn!(
+                    "failed to persist pre-dispatch transport failure {request_id}: {persist_error}"
+                );
+            }
             return json_error(502, "agent_disconnected", &error.to_string());
         }
 
@@ -454,27 +546,200 @@ impl TenantHub {
             }
         };
 
-        let Message::Response {
-            ok,
-            mut result,
-            error,
-            ..
-        } = message
+        let Some(body) =
+            agent_response_body(&message, &request_id, client_request_id.as_deref(), false)
         else {
             return json_error(502, "invalid_agent_response", "unexpected agent message");
         };
-        if let Some(result) = result.as_mut() {
-            result.remove("_sx_timing");
+        Response::from_json(&body)
+    }
+
+    fn begin_idempotency(
+        &self,
+        client_request_id: &str,
+        fingerprint: &str,
+        request_id: &str,
+    ) -> Result<Option<Response>> {
+        if client_request_id.is_empty() || client_request_id.len() > MAX_CLIENT_REQUEST_ID_BYTES {
+            return Ok(Some(json_error(
+                400,
+                "invalid_client_request_id",
+                "client_request_id must contain 1..=256 bytes",
+            )?));
         }
 
-        Response::from_json(&json!({
-            "ok": ok,
-            "result": result,
-            "error": error,
+        match self.begin_idempotency_inner(client_request_id, fingerprint, request_id) {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                console_warn!("idempotency storage unavailable: {error}");
+                Ok(Some(json_error(
+                    503,
+                    "idempotency_unavailable",
+                    "idempotency storage is unavailable; request was not dispatched",
+                )?))
+            }
+        }
+    }
+
+    fn begin_idempotency_inner(
+        &self,
+        client_request_id: &str,
+        fingerprint: &str,
+        request_id: &str,
+    ) -> Result<Option<Response>> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let sql = self.state.storage().sql();
+        sql.exec(
+            "DELETE FROM idempotency WHERE expires_ms <= ?",
+            vec![now_ms.into()],
+        )?;
+
+        let rows = sql
+            .exec(
+                "SELECT fingerprint, state, hub_request_id, response_json, http_status \
+                 FROM idempotency WHERE client_request_id = ? LIMIT 1",
+                vec![client_request_id.into()],
+            )?
+            .to_array::<IdempotencyRow>()?;
+
+        if let Some(row) = rows.first() {
+            if row.fingerprint != fingerprint {
+                return Ok(Some(json_error(
+                    409,
+                    "idempotency_conflict",
+                    "client_request_id was already used for a different invocation",
+                )?));
+            }
+
+            return match row.state.as_str() {
+                "pending" => Ok(Some(
+                    Response::from_json(&json!({
+                        "ok": false,
+                        "error": "idempotency_in_progress",
+                        "message": "the original invocation is still in progress",
+                        "client_request_id": client_request_id,
+                        "hub_request_id": row.hub_request_id,
+                        "replayed": false,
+                    }))?
+                    .with_status(409),
+                )),
+                "complete" => {
+                    let response_json = row.response_json.as_deref().ok_or_else(|| {
+                        Error::RustError("complete idempotency row has no response_json".to_owned())
+                    })?;
+                    let mut body = serde_json::from_str::<Value>(response_json)
+                        .map_err(|error| Error::RustError(error.to_string()))?;
+                    if let Value::Object(values) = &mut body {
+                        values.insert("replayed".to_owned(), Value::Bool(true));
+                    }
+                    let status = row
+                        .http_status
+                        .and_then(|status| u16::try_from(status).ok())
+                        .filter(|status| (100..=599).contains(status))
+                        .ok_or_else(|| {
+                            Error::RustError(
+                                "complete idempotency row has invalid http_status".to_owned(),
+                            )
+                        })?;
+                    Ok(Some(Response::from_json(&body)?.with_status(status)))
+                }
+                other => Err(Error::RustError(format!(
+                    "unknown idempotency state {other:?}"
+                ))),
+            };
+        }
+
+        sql.exec(
+            "INSERT INTO idempotency (\
+                client_request_id, fingerprint, state, hub_request_id, \
+                response_json, http_status, created_ms, expires_ms\
+             ) VALUES (?, ?, 'pending', ?, NULL, NULL, ?, ?)",
+            vec![
+                client_request_id.into(),
+                fingerprint.into(),
+                request_id.into(),
+                now_ms.into(),
+                (now_ms + IDEMPOTENCY_TTL_MS).into(),
+            ],
+        )?;
+        Ok(None)
+    }
+
+    fn persist_idempotent_agent_response_for_client(
+        &self,
+        request_id: &str,
+        client_request_id: &str,
+        message: &Message,
+    ) -> Result<()> {
+        let Some(body) = agent_response_body(message, request_id, Some(client_request_id), false)
+        else {
+            return Ok(());
+        };
+        self.complete_idempotency(client_request_id, request_id, 200, &body)
+    }
+
+    fn persist_idempotent_agent_response(&self, request_id: &str, message: &Message) -> Result<()> {
+        let rows = self
+            .state
+            .storage()
+            .sql()
+            .exec(
+                "SELECT client_request_id FROM idempotency \
+                 WHERE hub_request_id = ? AND state = 'pending' LIMIT 1",
+                vec![request_id.into()],
+            )?
+            .to_array::<IdempotencyRequestRow>()?;
+        let Some(row) = rows.first() else {
+            return Ok(());
+        };
+        let Some(body) =
+            agent_response_body(message, request_id, Some(&row.client_request_id), false)
+        else {
+            return Ok(());
+        };
+        self.complete_idempotency(&row.client_request_id, request_id, 200, &body)
+    }
+
+    fn complete_idempotency_http_error(
+        &self,
+        client_request_id: &str,
+        request_id: &str,
+        status: u16,
+        code: &str,
+        message: &str,
+    ) -> Result<()> {
+        let body = json!({
+            "ok": false,
+            "error": code,
+            "message": message,
+            "client_request_id": client_request_id,
             "hub_request_id": request_id,
-            "client_request_id": request.client_request_id,
-            "replayed": false
-        }))
+            "replayed": false,
+        });
+        self.complete_idempotency(client_request_id, request_id, status, &body)
+    }
+
+    fn complete_idempotency(
+        &self,
+        client_request_id: &str,
+        request_id: &str,
+        status: u16,
+        body: &Value,
+    ) -> Result<()> {
+        let response_json =
+            serde_json::to_string(body).map_err(|error| Error::RustError(error.to_string()))?;
+        self.state.storage().sql().exec(
+            "UPDATE idempotency SET \
+                state = 'complete', response_json = ?, http_status = ? \
+             WHERE client_request_id = ? AND hub_request_id = ? AND state = 'pending'",
+            vec![
+                response_json.into(),
+                i64::from(status).into(),
+                client_request_id.into(),
+                request_id.into(),
+            ],
+        )?;
+        Ok(())
     }
 
     fn live_sockets(&self) -> Result<HashMap<String, WebSocket>> {
@@ -530,7 +795,7 @@ impl TenantHub {
     fn resolve_socket(
         &self,
         selector: Option<&str>,
-    ) -> Result<std::result::Result<WebSocket, HostResolutionError>> {
+    ) -> Result<std::result::Result<(String, WebSocket), HostResolutionError>> {
         let live = self.live_sockets()?;
         let registry = self.load_registry(&live)?;
         let host_id = match registry.resolve(selector) {
@@ -538,7 +803,7 @@ impl TenantHub {
             Err(error) => return Ok(Err(error)),
         };
         match live.get(&host_id) {
-            Some(socket) => Ok(Ok(socket.clone())),
+            Some(socket) => Ok(Ok((host_id, socket.clone()))),
             None => Ok(Err(HostResolutionError::NotFound(host_id))),
         }
     }
@@ -659,6 +924,32 @@ impl TenantHub {
         *counter = counter.wrapping_add(1);
         format!("hreq_{}_{}", Date::now().as_millis(), *counter)
     }
+}
+
+fn agent_response_body(
+    message: &Message,
+    request_id: &str,
+    client_request_id: Option<&str>,
+    replayed: bool,
+) -> Option<Value> {
+    let Message::Response {
+        ok, result, error, ..
+    } = message
+    else {
+        return None;
+    };
+    let mut result = result.clone();
+    if let Some(result) = result.as_mut() {
+        result.remove("_sx_timing");
+    }
+    Some(json!({
+        "ok": ok,
+        "result": result,
+        "error": error,
+        "hub_request_id": request_id,
+        "client_request_id": client_request_id,
+        "replayed": replayed,
+    }))
 }
 
 fn host_resolution_error(error: &HostResolutionError) -> Result<Response> {
