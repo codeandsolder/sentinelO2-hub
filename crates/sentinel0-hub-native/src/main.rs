@@ -21,8 +21,9 @@ use sentinel0_hub_core::{
     DIRECT_TOOLS, DirectRequestError, DirectRequestInput, HostRegistry, HostResolutionError,
     PreparedDirectRequest, direct_rest_openapi, direct_tool_by_op, direct_tool_mcp_entry,
     model_tool_catalog, normalize_agent_response, parse_job_completion, prepare_direct_request,
+    prepare_protocol_request,
 };
-use sentinel0_proto::{HEARTBEAT_INTERVAL_SECS, Message};
+use sentinel0_proto::{HEARTBEAT_INTERVAL_SECS, Message, Op};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -705,7 +706,7 @@ async fn v1_set_host_disabled(
 }
 
 async fn v1_op(State(state): State<AppState>, Json(request): Json<OpRequest>) -> Response {
-    let mut prepared = {
+    let prepared = {
         let registry = state.hub.registry.read().await;
         match prepare_direct_request(
             &registry,
@@ -720,7 +721,29 @@ async fn v1_op(State(state): State<AppState>, Json(request): Json<OpRequest>) ->
             Err(error) => return direct_request_error(&error),
         }
     };
+    dispatch_prepared_request(&state, prepared).await
+}
 
+async fn dispatch_protocol_op(
+    state: AppState,
+    op: Op,
+    host_selector: Option<String>,
+    payload: Value,
+) -> Response {
+    let prepared = {
+        let registry = state.hub.registry.read().await;
+        match prepare_protocol_request(&registry, op, host_selector.as_deref(), payload, None) {
+            Ok(prepared) => prepared,
+            Err(error) => return direct_request_error(&error),
+        }
+    };
+    dispatch_prepared_request(&state, prepared).await
+}
+
+async fn dispatch_prepared_request(
+    state: &AppState,
+    mut prepared: PreparedDirectRequest,
+) -> Response {
     let session = state
         .hub
         .sessions
@@ -737,7 +760,7 @@ async fn v1_op(State(state): State<AppState>, Json(request): Json<OpRequest>) ->
     };
 
     let request_id = format!("hreq_{}", Uuid::now_v7().simple());
-    if let Some(response) = begin_native_idempotency(&state, &prepared, &request_id) {
+    if let Some(response) = begin_native_idempotency(state, &prepared, &request_id) {
         return response;
     }
 
@@ -751,7 +774,7 @@ async fn v1_op(State(state): State<AppState>, Json(request): Json<OpRequest>) ->
     let wire = prepared.wire_message(request_id.clone());
     let Ok(text) = serde_json::to_string(&wire) else {
         persist_terminal_request_error(
-            &state,
+            state,
             prepared.client_request_id.as_deref(),
             &request_id,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -765,7 +788,7 @@ async fn v1_op(State(state): State<AppState>, Json(request): Json<OpRequest>) ->
         );
     };
 
-    let message = match dispatch_and_wait(&state, &session, &prepared, &request_id, text).await {
+    let message = match dispatch_and_wait(state, &session, &prepared, &request_id, text).await {
         Ok(message) => message,
         Err(error) => {
             return api_error(error.status, error.code, error.message.to_owned());
@@ -778,7 +801,7 @@ async fn v1_op(State(state): State<AppState>, Json(request): Json<OpRequest>) ->
         false,
     ) else {
         persist_terminal_request_error(
-            &state,
+            state,
             prepared.client_request_id.as_deref(),
             &request_id,
             StatusCode::BAD_GATEWAY,

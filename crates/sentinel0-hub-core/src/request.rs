@@ -90,6 +90,30 @@ pub fn prepare_direct_request(
     } = input;
 
     let op = parse_direct_op(&op_name).ok_or(DirectRequestError::UnsupportedOp(op_name))?;
+    prepare_protocol_request(
+        registry,
+        op,
+        host_selector.as_deref(),
+        payload,
+        client_request_id,
+    )
+}
+
+/// Resolve and normalize an already-authorized protocol operation.
+///
+/// Hub compositions use this for wire operations such as generic Git/service
+/// that are intentionally not accepted by the public direct REST surface.
+///
+/// # Errors
+/// Returns the same validation and host-resolution errors as
+/// [`prepare_direct_request`].
+pub fn prepare_protocol_request(
+    registry: &HostRegistry,
+    op: Op,
+    host_selector: Option<&str>,
+    payload: Value,
+    client_request_id: Option<String>,
+) -> Result<PreparedDirectRequest, DirectRequestError> {
     if client_request_id
         .as_deref()
         .is_some_and(|id| id.is_empty() || id.len() > MAX_CLIENT_REQUEST_ID_BYTES)
@@ -97,7 +121,7 @@ pub fn prepare_direct_request(
         return Err(DirectRequestError::InvalidClientRequestId);
     }
 
-    let host_id = registry.resolve(host_selector.as_deref())?.host_id.clone();
+    let host_id = registry.resolve(host_selector)?.host_id.clone();
     let mut values = match payload {
         Value::Object(values) => values,
         Value::Null => serde_json::Map::new(),

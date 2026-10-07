@@ -11,9 +11,9 @@ use sentinel0_hub_core::{
     DIRECT_TOOLS, DirectRequestError, DirectRequestInput, DirectResponse, HostRecord, HostRegistry,
     HostResolutionError, JobCompletion, direct_rest_openapi, direct_tool_by_op,
     direct_tool_mcp_entry, model_tool_catalog, normalize_agent_response, parse_job_completion,
-    prepare_direct_request,
+    prepare_direct_request, prepare_protocol_request,
 };
-use sentinel0_proto::{HEARTBEAT_INTERVAL_SECS, Message};
+use sentinel0_proto::{HEARTBEAT_INTERVAL_SECS, Message, Op};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{cell::RefCell, collections::HashMap, time::Duration};
@@ -682,7 +682,7 @@ impl TenantHub {
     async fn dispatch_op(&self, request: OpRequest) -> Result<Response> {
         let live = self.live_sockets()?;
         let registry = self.load_registry(&live)?;
-        let mut prepared = match prepare_direct_request(
+        let prepared = match prepare_direct_request(
             &registry,
             DirectRequestInput {
                 op_name: request.op,
@@ -694,6 +694,35 @@ impl TenantHub {
             Ok(prepared) => prepared,
             Err(error) => return direct_request_error(&error),
         };
+        self.dispatch_prepared_request(prepared, &live).await
+    }
+
+    async fn dispatch_protocol_op(
+        &self,
+        op: Op,
+        host_selector: Option<String>,
+        payload: Value,
+    ) -> Result<Response> {
+        let live = self.live_sockets()?;
+        let registry = self.load_registry(&live)?;
+        let prepared = match prepare_protocol_request(
+            &registry,
+            op,
+            host_selector.as_deref(),
+            payload,
+            None,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => return direct_request_error(&error),
+        };
+        self.dispatch_prepared_request(prepared, &live).await
+    }
+
+    async fn dispatch_prepared_request(
+        &self,
+        mut prepared: sentinel0_hub_core::PreparedDirectRequest,
+        live: &HashMap<String, WebSocket>,
+    ) -> Result<Response> {
         let Some(socket) = live.get(&prepared.host_id).cloned() else {
             return json_error(
                 502,

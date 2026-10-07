@@ -3,11 +3,12 @@
 use super::{NotificationsRequest, OpRequest, TenantHub};
 use sentinel0_hub_core::{
     DirectResponse, HubToolKind, JSONRPC_METHOD_NOT_FOUND, McpHubCall, McpRequest, McpRequestError,
-    McpToolCall, mcp_discover_response, mcp_jsonrpc_error, mcp_jsonrpc_result, mcp_tool_error,
-    mcp_tool_result_from_direct, mcp_tool_success, mcp_tools_list_response, parse_mcp_tool_call,
-    validate_modern_mcp_request,
+    McpToolCall, hub_protocol_call, mcp_discover_response, mcp_jsonrpc_error, mcp_jsonrpc_result,
+    mcp_tool_error, mcp_tool_result_from_direct, mcp_tool_success, mcp_tools_list_response,
+    parse_mcp_tool_call, validate_modern_mcp_request,
 };
-use serde_json::{Value, json};
+use sentinel0_proto::Op;
+use serde_json::{Map, Value, json};
 use worker::{Request, Response, Result};
 
 impl TenantHub {
@@ -77,6 +78,17 @@ impl TenantHub {
     }
 
     async fn mcp_hub_call(&self, call: McpHubCall) -> Result<Value> {
+        match hub_protocol_call(call.kind, &call.arguments) {
+            Ok(Some(protocol)) => {
+                let response = self
+                    .dispatch_protocol_op(protocol.op, protocol.host_selector, protocol.payload)
+                    .await?;
+                return Ok(direct_response_to_tool_result(response).await);
+            }
+            Ok(None) => {}
+            Err(error) => return Ok(mcp_tool_error(error.to_string(), None)),
+        }
+
         let response = match call.kind {
             HubToolKind::ListHosts => self.list_hosts_response()?,
             HubToolKind::GetDefaultHost => self.default_host_response()?,
@@ -101,6 +113,23 @@ impl TenantHub {
             }
             HubToolKind::RemoveHostLabel => {
                 return self.mcp_remove_host_label(&call.arguments).await;
+            }
+            HubToolKind::ServiceStatus => {
+                return self.mcp_service_status(&call.arguments).await;
+            }
+            HubToolKind::GitDiff
+            | HubToolKind::GitApplyPatch
+            | HubToolKind::GitLsRemote
+            | HubToolKind::GitFetch
+            | HubToolKind::GitClone
+            | HubToolKind::GitPush
+            | HubToolKind::ServiceStart
+            | HubToolKind::ServiceStop
+            | HubToolKind::ServiceReload => {
+                return Ok(mcp_tool_error(
+                    "internal Hub protocol wrapper routing failure",
+                    None,
+                ));
             }
             HubToolKind::NotificationsCheck => self.notifications(&NotificationsRequest {
                 operation: "check".to_owned(),
@@ -139,6 +168,58 @@ impl TenantHub {
         Ok(hub_response_to_tool_result(response).await)
     }
 
+    async fn mcp_service_status(&self, arguments: &Value) -> Result<Value> {
+        let service = match required_string(arguments, "service") {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        };
+        let host_selector = match optional_string(arguments, "host_id") {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        };
+        let opaque_ref = match optional_string(arguments, "opaque_ref") {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        };
+
+        let mut base = Map::new();
+        base.insert("service".to_owned(), Value::String(service.clone()));
+        if let Some(opaque_ref) = opaque_ref {
+            base.insert("opaque_ref".to_owned(), Value::String(opaque_ref));
+        }
+
+        let status = self
+            .service_status_part(host_selector.clone(), &base, "status")
+            .await?;
+        let is_active = self
+            .service_status_part(host_selector.clone(), &base, "is-active")
+            .await?;
+        let is_enabled = self
+            .service_status_part(host_selector, &base, "is-enabled")
+            .await?;
+        Ok(mcp_tool_success(&json!({
+            "ok": true,
+            "service": service,
+            "status": status,
+            "is_active": is_active,
+            "is_enabled": is_enabled,
+        })))
+    }
+
+    async fn service_status_part(
+        &self,
+        host_selector: Option<String>,
+        base: &Map<String, Value>,
+        action: &str,
+    ) -> Result<Value> {
+        let mut payload = base.clone();
+        payload.insert("action".to_owned(), Value::String(action.to_owned()));
+        let response = self
+            .dispatch_protocol_op(Op::Service, host_selector, Value::Object(payload))
+            .await?;
+        Ok(direct_response_to_part(response).await)
+    }
+
     async fn mcp_remove_host_label(&self, arguments: &Value) -> Result<Value> {
         let host_id = match required_string(arguments, "host_id") {
             Ok(value) => value,
@@ -164,6 +245,17 @@ fn required_string(arguments: &Value, name: &str) -> std::result::Result<String,
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| mcp_tool_error(format!("{name} must be a string"), None))
+}
+
+fn optional_string(arguments: &Value, name: &str) -> std::result::Result<Option<String>, Value> {
+    match arguments.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(mcp_tool_error(
+            format!("{name} must be a string or null"),
+            None,
+        )),
+    }
 }
 
 fn modern_request_error(id: &Value, error: &McpRequestError) -> Result<Response> {
@@ -200,6 +292,46 @@ async fn direct_response_to_tool_result(response: Response) -> Value {
         };
     }
     http_error_to_tool_result(value)
+}
+
+async fn direct_response_to_part(response: Response) -> Value {
+    let status = response.status_code();
+    let value = match response_json(response).await {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if !(200..300).contains(&status) {
+        return value;
+    }
+    let response = match serde_json::from_value::<DirectResponse>(value.clone()) {
+        Ok(response) => response,
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "error": "invalid_hub_response",
+                "message": error.to_string(),
+            });
+        }
+    };
+    if response.ok {
+        return response.result.map_or_else(
+            || json!({"ok": true}),
+            |result| {
+                let mut result = result.into_iter().collect::<Map<String, Value>>();
+                result.entry("ok".to_owned()).or_insert(Value::Bool(true));
+                Value::Object(result)
+            },
+        );
+    }
+    match response.error {
+        Some(error) => json!({
+            "ok": false,
+            "error": error.code,
+            "message": error.message,
+            "details": error.details,
+        }),
+        None => json!({"ok": false, "error": "agent_error", "message": "agent operation failed"}),
+    }
 }
 
 async fn hub_response_to_tool_result(response: Response) -> Value {

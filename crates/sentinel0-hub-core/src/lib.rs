@@ -21,8 +21,9 @@ mod tooling;
 mod transfer;
 
 pub use hub_tools::{
-    HUB_TOOLS, HubTool, HubToolKind, hub_tool_by_public_name, hub_tool_catalog,
-    hub_tool_description, hub_tool_input_schema, hub_tool_mcp_entry, model_tool_catalog,
+    HUB_TOOLS, HubProtocolCall, HubTool, HubToolArgumentError, HubToolKind, hub_protocol_call,
+    hub_tool_by_public_name, hub_tool_catalog, hub_tool_description, hub_tool_input_schema,
+    hub_tool_mcp_entry, model_tool_catalog,
 };
 pub use jobs::{JOB_COMPLETED_EVENT, JobCompletion, JobEventError, parse_job_completion};
 pub use mcp::{
@@ -36,7 +37,7 @@ pub use mcp::{
 pub use request::{
     DirectRequestError, DirectRequestInput, DirectResponse, DirectResponseError,
     MAX_CLIENT_REQUEST_ID_BYTES, PreparedDirectRequest, normalize_agent_response,
-    prepare_direct_request,
+    prepare_direct_request, prepare_protocol_request,
 };
 pub use tooling::{
     direct_tool_catalog, direct_tool_description, direct_tool_input_schema, direct_tool_mcp_entry,
