@@ -2,6 +2,8 @@
 
 //! Cloudflare Workers + Durable Objects adapter for the Sentinel0² Hub.
 
+mod transfer;
+
 use futures_channel::oneshot;
 use futures_util::future::{Either, select};
 use sentinel0_hub_core::{
@@ -158,6 +160,8 @@ pub struct TenantHub {
     state: State,
     env: Env,
     pending: RefCell<HashMap<String, PendingRequest>>,
+    transfer_binary_waiters: RefCell<transfer::BinaryWaiters>,
+    transfer_ack_waiters: RefCell<transfer::AckWaiters>,
     request_counter: RefCell<u64>,
 }
 
@@ -167,6 +171,8 @@ impl DurableObject for TenantHub {
             state,
             env,
             pending: RefCell::new(HashMap::new()),
+            transfer_binary_waiters: RefCell::new(HashMap::new()),
+            transfer_ack_waiters: RefCell::new(HashMap::new()),
             request_counter: RefCell::new(0),
         };
         if let Err(error) = hub.initialize_schema() {
@@ -219,6 +225,10 @@ impl DurableObject for TenantHub {
                 let request = req.json::<NotificationsRequest>().await?;
                 self.notifications(&request)
             }
+            (Method::Post, "/v1/transfer-file") => {
+                let request = req.json::<transfer::TransferFileRequest>().await?;
+                self.transfer_file(request).await
+            }
             _ => Response::error("not found", 404),
         }
     }
@@ -229,9 +239,17 @@ impl DurableObject for TenantHub {
         ws: WebSocket,
         incoming: WebSocketIncomingMessage,
     ) -> Result<()> {
-        let WebSocketIncomingMessage::String(raw) = incoming else {
-            console_warn!("binary frame received before transfer coordinator exists");
-            return Ok(());
+        let attachment = self.resolve_attachment(&ws)?;
+        let raw = match incoming {
+            WebSocketIncomingMessage::String(raw) => raw,
+            WebSocketIncomingMessage::Binary(raw) => {
+                if let Some(host_id) = attachment.host_id.as_deref() {
+                    self.handle_transfer_binary(host_id, raw);
+                } else {
+                    console_warn!("binary frame received before agent hello");
+                }
+                return Ok(());
+            }
         };
 
         let message = match serde_json::from_str::<Message>(&raw) {
@@ -241,8 +259,6 @@ impl DurableObject for TenantHub {
                 return Ok(());
             }
         };
-
-        let attachment = self.resolve_attachment(&ws)?;
 
         if attachment.host_id.is_none() {
             return self.accept_hello(&ws, message);
@@ -269,6 +285,9 @@ impl DurableObject for TenantHub {
                 ws.send(&Message::Pong { timestamp })?;
             }
             Message::Event { ref kind, .. } => {
+                if let Some(host_id) = attachment.host_id.as_deref() {
+                    self.handle_transfer_event(host_id, &message);
+                }
                 match parse_job_completion(&message) {
                     Ok(Some(completion)) => {
                         if attachment.host_id.as_deref() != Some(completion.host_id.as_str()) {
