@@ -2,6 +2,7 @@
 
 //! Cloudflare Workers + Durable Objects adapter for the Sentinel0² Hub.
 
+mod mcp;
 mod transfer;
 
 use futures_channel::oneshot;
@@ -184,7 +185,7 @@ impl DurableObject for TenantHub {
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         let url = req.url()?;
-        if url.path().starts_with("/v1/")
+        if (url.path().starts_with("/v1/") || url.path() == "/mcp")
             && let Some(response) = self.api_auth_error(&req)?
         {
             return Ok(response);
@@ -200,6 +201,7 @@ impl DurableObject for TenantHub {
                 Response::from_json(&json!({"ok": true, "service": "sentinel0-hub-worker"}))
             }
             (Method::Get, "/agent/connect") => self.upgrade_agent(&req),
+            (Method::Post, "/mcp") => self.mcp(req).await,
             (Method::Post, "/v1/op") => {
                 let request = req.json::<OpRequest>().await?;
                 self.dispatch_op(request).await
@@ -1413,11 +1415,13 @@ fn direct_request_error(error: &DirectRequestError) -> Result<Response> {
     match error {
         DirectRequestError::UnsupportedOp(_)
         | DirectRequestError::InvalidPayload(_)
-        | DirectRequestError::InvalidClientRequestId => {
+        | DirectRequestError::InvalidClientRequestId
+        | DirectRequestError::InvalidOpaqueRef => {
             let code = match error {
                 DirectRequestError::UnsupportedOp(_) => "unsupported_op",
                 DirectRequestError::InvalidPayload(_) => "invalid_payload",
                 DirectRequestError::InvalidClientRequestId => "invalid_client_request_id",
+                DirectRequestError::InvalidOpaqueRef => "invalid_opaque_ref",
                 DirectRequestError::Host(_) => unreachable!("host errors handled separately"),
             };
             json_error(400, code, &error.to_string())

@@ -14,11 +14,19 @@ use std::fmt::Write as _;
 use thiserror::Error;
 
 mod jobs;
+mod mcp;
 mod request;
 mod tooling;
 mod transfer;
 
 pub use jobs::{JOB_COMPLETED_EVENT, JobCompletion, JobEventError, parse_job_completion};
+pub use mcp::{
+    JSONRPC_INVALID_PARAMS, JSONRPC_INVALID_REQUEST, JSONRPC_METHOD_NOT_FOUND, MCP_HEADER_MISMATCH,
+    MCP_PROTOCOL_VERSION, McpDirectCall, McpRequest, McpRequestError, mcp_discover_response,
+    mcp_jsonrpc_error, mcp_jsonrpc_result, mcp_response_meta, mcp_server_info, mcp_tool_error,
+    mcp_tool_result_from_direct, mcp_tool_success, mcp_tools_list_response, parse_mcp_direct_call,
+    validate_modern_mcp_request,
+};
 pub use request::{
     DirectRequestError, DirectRequestInput, DirectResponse, DirectResponseError,
     MAX_CLIENT_REQUEST_ID_BYTES, PreparedDirectRequest, normalize_agent_response,
@@ -577,6 +585,56 @@ mod tests {
             by_id.invocation_fingerprint
         );
         assert_eq!(by_label.payload, by_id.payload);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_request_extracts_and_validates_opaque_ref() -> Result<(), DirectRequestError> {
+        let mut registry = HostRegistry::default();
+        registry.register_hello(&host("host_a", "alpha"));
+
+        let prepared = prepare_direct_request(
+            &registry,
+            DirectRequestInput {
+                op_name: "exec".to_owned(),
+                host_selector: Some("host_a".to_owned()),
+                payload: serde_json::json!({"command": "true", "opaque_ref": "trace-1"}),
+                client_request_id: Some("req-opaque".to_owned()),
+            },
+        )?;
+        assert_eq!(prepared.opaque_ref.as_deref(), Some("trace-1"));
+        assert!(!prepared.payload.contains_key("opaque_ref"));
+        let wire = prepared.wire_message("wire-1".to_owned());
+        assert!(matches!(
+            wire,
+            sentinel0_proto::Message::Request { opaque_ref: Some(ref value), .. } if value == "trace-1"
+        ));
+
+        let changed = prepare_direct_request(
+            &registry,
+            DirectRequestInput {
+                op_name: "exec".to_owned(),
+                host_selector: Some("host_a".to_owned()),
+                payload: serde_json::json!({"command": "true", "opaque_ref": "trace-2"}),
+                client_request_id: Some("req-opaque".to_owned()),
+            },
+        )?;
+        assert_ne!(
+            prepared.invocation_fingerprint,
+            changed.invocation_fingerprint
+        );
+
+        let too_long = "x".repeat(257);
+        let invalid = prepare_direct_request(
+            &registry,
+            DirectRequestInput {
+                op_name: "exec".to_owned(),
+                host_selector: Some("host_a".to_owned()),
+                payload: serde_json::json!({"command": "true", "opaque_ref": too_long}),
+                client_request_id: None,
+            },
+        );
+        assert_eq!(invalid, Err(DirectRequestError::InvalidOpaqueRef));
         Ok(())
     }
 

@@ -27,6 +27,7 @@ pub struct PreparedDirectRequest {
     pub op: Op,
     pub host_id: String,
     pub payload: BTreeMap<String, Value>,
+    pub opaque_ref: Option<String>,
     pub client_request_id: Option<String>,
     pub invocation_fingerprint: Option<String>,
 }
@@ -52,7 +53,7 @@ impl PreparedDirectRequest {
             op: self.op,
             payload: self.payload.clone(),
             deadline: None,
-            opaque_ref: None,
+            opaque_ref: self.opaque_ref.clone(),
         }
     }
 }
@@ -65,6 +66,8 @@ pub enum DirectRequestError {
     InvalidPayload(String),
     #[error("client_request_id must contain 1..=256 bytes")]
     InvalidClientRequestId,
+    #[error("opaque_ref must be a string of at most 256 characters")]
+    InvalidOpaqueRef,
     #[error(transparent)]
     Host(#[from] HostResolutionError),
 }
@@ -95,21 +98,27 @@ pub fn prepare_direct_request(
     }
 
     let host_id = registry.resolve(host_selector.as_deref())?.host_id.clone();
-    let values = match payload {
+    let mut values = match payload {
         Value::Object(values) => values,
         Value::Null => serde_json::Map::new(),
         other => return Err(DirectRequestError::InvalidPayload(other.to_string())),
     };
-    let payload_value = Value::Object(values.clone());
+    let fingerprint_value = Value::Object(values.clone());
+    let opaque_ref = match values.remove("opaque_ref") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if value.chars().count() <= 256 => Some(value),
+        Some(_) => return Err(DirectRequestError::InvalidOpaqueRef),
+    };
     let payload = values.into_iter().collect::<BTreeMap<String, Value>>();
     let fingerprint = client_request_id
         .as_ref()
-        .map(|_| invocation_fingerprint(op, &host_id, &payload_value));
+        .map(|_| invocation_fingerprint(op, &host_id, &fingerprint_value));
 
     Ok(PreparedDirectRequest {
         op,
         host_id,
         payload,
+        opaque_ref,
         client_request_id,
         invocation_fingerprint: fingerprint,
     })

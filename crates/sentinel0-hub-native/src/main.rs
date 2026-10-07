@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod mcp;
 mod store;
 mod transfer;
 
@@ -159,10 +160,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             require_api_auth,
         ));
 
+    let mcp =
+        Router::new()
+            .route("/mcp", post(mcp::mcp))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_api_auth,
+            ));
+
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/agent/connect", get(agent_connect))
         .nest("/v1", v1)
+        .merge(mcp)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
@@ -1048,11 +1058,13 @@ fn direct_request_error(error: &DirectRequestError) -> Response {
     match error {
         DirectRequestError::UnsupportedOp(_)
         | DirectRequestError::InvalidPayload(_)
-        | DirectRequestError::InvalidClientRequestId => {
+        | DirectRequestError::InvalidClientRequestId
+        | DirectRequestError::InvalidOpaqueRef => {
             let code = match error {
                 DirectRequestError::UnsupportedOp(_) => "unsupported_op",
                 DirectRequestError::InvalidPayload(_) => "invalid_payload",
                 DirectRequestError::InvalidClientRequestId => "invalid_client_request_id",
+                DirectRequestError::InvalidOpaqueRef => "invalid_opaque_ref",
                 DirectRequestError::Host(_) => unreachable!("host errors handled separately"),
             };
             api_error(StatusCode::BAD_REQUEST, code, error.to_string())
