@@ -15,12 +15,19 @@ use thiserror::Error;
 
 mod jobs;
 mod request;
+mod transfer;
 
 pub use jobs::{JOB_COMPLETED_EVENT, JobCompletion, JobEventError, parse_job_completion};
 pub use request::{
     DirectRequestError, DirectRequestInput, DirectResponse, DirectResponseError,
     MAX_CLIENT_REQUEST_ID_BYTES, PreparedDirectRequest, normalize_agent_response,
     prepare_direct_request,
+};
+pub use transfer::{
+    ExportChunkResult, ExportDigest, ExportPlan, HUB_TRANSFER_MAX_BYTES, TRANSFER_CHUNK_ACK_EVENT,
+    TransferChunkAck, TransferProtocolError, UploadResult, parse_export_chunk_result,
+    parse_export_digest, parse_export_plan, parse_transfer_chunk_ack, parse_upload_result,
+    validate_upload_init,
 };
 
 /// One enrolled host as understood by the Hub control plane.

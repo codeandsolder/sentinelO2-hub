@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod store;
+mod transfer;
 
 use axum::{
     Json, Router,
@@ -46,6 +47,8 @@ struct Hub {
     registry: RwLock<HostRegistry>,
     sessions: RwLock<HashMap<String, AgentSession>>,
     pending: Mutex<HashMap<String, PendingRequest>>,
+    transfer_binary_waiters: Mutex<transfer::BinaryWaiters>,
+    transfer_ack_waiters: Mutex<transfer::AckWaiters>,
     store: StdMutex<NativeStore>,
 }
 
@@ -128,6 +131,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             registry: RwLock::new(registry),
             sessions: RwLock::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            transfer_binary_waiters: Mutex::new(HashMap::new()),
+            transfer_ack_waiters: Mutex::new(HashMap::new()),
             store: StdMutex::new(store),
         }),
     };
@@ -148,6 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/hosts/label", put(v1_set_host_label))
         .route("/hosts/disabled", put(v1_set_host_disabled))
         .route("/notifications", post(v1_notifications))
+        .route("/transfer-file", post(transfer::v1_transfer_file))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_auth,
@@ -298,8 +304,8 @@ async fn serve_agent(state: AppState, socket: WebSocket) {
                     Some(Ok(WsMessage::Text(raw))) => {
                         handle_agent_text(&state, &host_id, &raw).await;
                     }
-                    Some(Ok(WsMessage::Binary(_))) => {
-                        warn!(%host_id, "binary frame received before transfer coordinator exists");
+                    Some(Ok(WsMessage::Binary(raw))) => {
+                        transfer::handle_binary_frame(&state, &host_id, raw.to_vec()).await;
                     }
                     Some(Ok(WsMessage::Close(_)) | Err(_)) | None => break,
                     Some(Ok(_)) => {}
@@ -425,6 +431,7 @@ async fn handle_agent_text(state: &AppState, host_id: &str, raw: &str) {
             }
         }
         Message::Event { ref kind, .. } => {
+            transfer::handle_transfer_event(state, host_id, &message).await;
             match parse_job_completion(&message) {
                 Ok(Some(completion)) => {
                     if completion.host_id != host_id {
