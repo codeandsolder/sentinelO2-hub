@@ -15,6 +15,7 @@ use thiserror::Error;
 
 mod jobs;
 mod request;
+mod tooling;
 mod transfer;
 
 pub use jobs::{JOB_COMPLETED_EVENT, JobCompletion, JobEventError, parse_job_completion};
@@ -22,6 +23,9 @@ pub use request::{
     DirectRequestError, DirectRequestInput, DirectResponse, DirectResponseError,
     MAX_CLIENT_REQUEST_ID_BYTES, PreparedDirectRequest, normalize_agent_response,
     prepare_direct_request,
+};
+pub use tooling::{
+    direct_tool_catalog, direct_tool_description, direct_tool_input_schema, direct_tool_mcp_entry,
 };
 pub use transfer::{
     ExportChunkResult, ExportDigest, ExportPlan, HUB_TRANSFER_MAX_BYTES, TRANSFER_CHUNK_ACK_EVENT,
@@ -441,7 +445,7 @@ pub fn direct_rest_openapi() -> Value {
                 }
             }
         },
-        "x-sentinel-direct-tools": DIRECT_TOOLS
+        "x-sentinel-direct-tools": direct_tool_catalog(&DIRECT_TOOLS)
     })
 }
 

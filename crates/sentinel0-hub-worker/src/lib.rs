@@ -9,7 +9,8 @@ use futures_util::future::{Either, select};
 use sentinel0_hub_core::{
     DIRECT_TOOLS, DirectRequestError, DirectRequestInput, DirectResponse, HostRecord, HostRegistry,
     HostResolutionError, JobCompletion, direct_rest_openapi, direct_tool_by_op,
-    normalize_agent_response, parse_job_completion, prepare_direct_request,
+    direct_tool_catalog, direct_tool_mcp_entry, normalize_agent_response, parse_job_completion,
+    prepare_direct_request,
 };
 use sentinel0_proto::{HEARTBEAT_INTERVAL_SECS, Message};
 use serde::{Deserialize, Serialize};
@@ -1264,7 +1265,7 @@ impl TenantHub {
     }
 
     fn direct_tools_response() -> Result<Response> {
-        Response::from_json(&json!({"ok": true, "tools": DIRECT_TOOLS}))
+        Response::from_json(&json!({"ok": true, "tools": direct_tool_catalog(&DIRECT_TOOLS)}))
     }
 
     fn direct_op_info_response(op_name: &str) -> Result<Response> {
@@ -1275,7 +1276,7 @@ impl TenantHub {
                 &format!("unsupported op {op_name:?}"),
             );
         };
-        Response::from_json(&json!({"ok": true, "op": tool}))
+        Response::from_json(&json!({"ok": true, "op": tool, "tool": direct_tool_mcp_entry(tool)}))
     }
 
     fn list_hosts_response(&self) -> Result<Response> {
