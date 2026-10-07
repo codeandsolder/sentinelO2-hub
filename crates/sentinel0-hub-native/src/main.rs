@@ -3,7 +3,7 @@
 use axum::{
     Json, Router,
     extract::{
-        State, WebSocketUpgrade,
+        Path, State, WebSocketUpgrade,
         ws::{Message as WsMessage, WebSocket},
     },
     http::{HeaderMap, StatusCode},
@@ -13,8 +13,8 @@ use axum::{
 use chrono::Utc;
 use futures_util::{SinkExt as _, StreamExt as _};
 use sentinel0_hub_core::{
-    DirectRequestError, DirectRequestInput, HostRegistry, HostResolutionError,
-    normalize_agent_response, prepare_direct_request,
+    DIRECT_TOOLS, DirectRequestError, DirectRequestInput, HostRegistry, HostResolutionError,
+    direct_tool_by_op, normalize_agent_response, prepare_direct_request,
 };
 use sentinel0_proto::{HEARTBEAT_INTERVAL_SECS, Message};
 use serde::{Deserialize, Serialize};
@@ -83,6 +83,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(healthz))
         .route("/agent/connect", get(agent_connect))
         .route("/v1/op", post(v1_op))
+        .route("/v1/ops", get(v1_ops))
+        .route("/v1/ops/{op}", get(v1_op_info))
+        .route("/v1/tools", get(v1_tools))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
@@ -93,6 +96,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn healthz() -> Json<Value> {
     Json(json!({"ok": true, "service": "sentinel0-hub-native"}))
+}
+
+async fn v1_ops() -> Json<Value> {
+    Json(json!({"ok": true, "ops": DIRECT_TOOLS}))
+}
+
+async fn v1_tools() -> Json<Value> {
+    Json(json!({"ok": true, "tools": DIRECT_TOOLS}))
+}
+
+async fn v1_op_info(Path(op): Path<String>) -> Response {
+    let Some(tool) = direct_tool_by_op(&op) else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "unsupported_op",
+            format!("unsupported op {op:?}"),
+        );
+    };
+    (StatusCode::OK, Json(json!({"ok": true, "op": tool}))).into_response()
 }
 
 async fn agent_connect(

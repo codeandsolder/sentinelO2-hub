@@ -5,9 +5,9 @@
 use futures_channel::oneshot;
 use futures_util::future::{Either, select};
 use sentinel0_hub_core::{
-    DirectRequestError, DirectRequestInput, DirectResponse, HostRecord, HostRegistry,
-    HostResolutionError, JobCompletion, normalize_agent_response, parse_job_completion,
-    prepare_direct_request,
+    DIRECT_TOOLS, DirectRequestError, DirectRequestInput, DirectResponse, HostRecord, HostRegistry,
+    HostResolutionError, JobCompletion, direct_tool_by_op, normalize_agent_response,
+    parse_job_completion, prepare_direct_request,
 };
 use sentinel0_proto::{HEARTBEAT_INTERVAL_SECS, Message};
 use serde::{Deserialize, Serialize};
@@ -182,6 +182,12 @@ impl DurableObject for TenantHub {
         {
             return Ok(response);
         }
+        if req.method() == Method::Get
+            && let Some(op_name) = url.path().strip_prefix("/v1/ops/")
+            && !op_name.is_empty()
+        {
+            return Self::direct_op_info_response(op_name);
+        }
         match (req.method(), url.path()) {
             (Method::Get, "/healthz") => {
                 Response::from_json(&json!({"ok": true, "service": "sentinel0-hub-worker"}))
@@ -191,6 +197,8 @@ impl DurableObject for TenantHub {
                 let request = req.json::<OpRequest>().await?;
                 self.dispatch_op(request).await
             }
+            (Method::Get, "/v1/ops") => Self::direct_ops_response(),
+            (Method::Get, "/v1/tools") => Self::direct_tools_response(),
             (Method::Get, "/v1/hosts") => self.list_hosts_response(),
             (Method::Get, "/v1/default-host") => self.default_host_response(),
             (Method::Put, "/v1/default-host") => {
@@ -1211,6 +1219,25 @@ impl TenantHub {
             )?
             .to_array::<SettingRow>()?;
         Ok(rows.first().map(|row| row.value.clone()))
+    }
+
+    fn direct_ops_response() -> Result<Response> {
+        Response::from_json(&json!({"ok": true, "ops": DIRECT_TOOLS}))
+    }
+
+    fn direct_tools_response() -> Result<Response> {
+        Response::from_json(&json!({"ok": true, "tools": DIRECT_TOOLS}))
+    }
+
+    fn direct_op_info_response(op_name: &str) -> Result<Response> {
+        let Some(tool) = direct_tool_by_op(op_name) else {
+            return json_error(
+                404,
+                "unsupported_op",
+                &format!("unsupported op {op_name:?}"),
+            );
+        };
+        Response::from_json(&json!({"ok": true, "op": tool}))
     }
 
     fn list_hosts_response(&self) -> Result<Response> {

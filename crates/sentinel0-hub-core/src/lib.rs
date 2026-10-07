@@ -209,8 +209,9 @@ impl HostRegistry {
 }
 
 /// Direct model-facing tools that route one-for-one to an agent operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct DirectTool {
+    #[serde(rename = "tool")]
     pub public_name: &'static str,
     pub op: Op,
 }
@@ -325,6 +326,16 @@ pub const DIRECT_TOOLS: [DirectTool; 27] = [
         op: Op::LocalApi,
     },
 ];
+
+#[must_use]
+pub fn direct_tool_by_op(name: &str) -> Option<&'static DirectTool> {
+    DIRECT_TOOLS.iter().find(|tool| tool.op.as_str() == name)
+}
+
+#[must_use]
+pub fn direct_tool_by_public_name(name: &str) -> Option<&'static DirectTool> {
+    DIRECT_TOOLS.iter().find(|tool| tool.public_name == name)
+}
 
 #[must_use]
 pub fn parse_op(name: &str) -> Option<Op> {
@@ -532,5 +543,14 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), 27);
+        assert_eq!(
+            direct_tool_by_op("exec").map(|tool| tool.public_name),
+            Some("sentinel_exec")
+        );
+        assert_eq!(
+            direct_tool_by_public_name("sentinel_exec").map(|tool| tool.op),
+            Some(Op::Exec)
+        );
+        assert!(direct_tool_by_op("nope").is_none());
     }
 }
