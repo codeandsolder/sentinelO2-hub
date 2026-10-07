@@ -308,6 +308,7 @@ impl DurableObject for TenantHub {
             };
             if was_current {
                 self.mark_disconnected(host_id)?;
+                self.mark_running_jobs_orphaned(host_id)?;
             }
         }
         console_log!(
@@ -997,6 +998,16 @@ impl TenantHub {
         Ok(())
     }
 
+    fn mark_running_jobs_orphaned(&self, host_id: &str) -> Result<()> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.state.storage().sql().exec(
+            "UPDATE jobs SET status = 'orphaned', updated_ms = ? \
+             WHERE host_id = ? AND status = 'running'",
+            vec![now_ms.into(), host_id.into()],
+        )?;
+        Ok(())
+    }
+
     fn persist_job_started(&self, job_id: &str, host_id: &str, tool: &str) -> Result<()> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         self.state.storage().sql().exec(
@@ -1112,11 +1123,18 @@ impl TenantHub {
                 None::<Vec<SqlStorageValue>>,
             )?
             .to_array::<RunningJobRow>()?;
+        let orphaned = sql
+            .exec(
+                "SELECT job_id, host_id AS host, tool, status FROM jobs \
+                 WHERE status = 'orphaned' ORDER BY updated_ms LIMIT 100",
+                None::<Vec<SqlStorageValue>>,
+            )?
+            .to_array::<RunningJobRow>()?;
         Response::from_json(&json!({
             "ok": true,
             "completed": completed,
             "running": running,
-            "orphaned": [],
+            "orphaned": orphaned,
             "broadcasts": [],
             "answered_reports": [],
         }))
