@@ -15,6 +15,7 @@ pub const JSONRPC_METHOD_NOT_FOUND: i64 = -32_601;
 pub const JSONRPC_INVALID_PARAMS: i64 = -32_602;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpRequest {
     pub jsonrpc: String,
     pub id: Value,
