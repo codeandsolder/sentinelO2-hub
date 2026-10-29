@@ -52,6 +52,7 @@ struct SocketAttachment {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OpRequest {
     op: String,
     host_id: Option<String>,
@@ -61,23 +62,27 @@ struct OpRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SetDefaultRequest {
     host_id: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SetLabelRequest {
     host_id: String,
     label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SetDisabledRequest {
     host_id: String,
     disabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NotificationsRequest {
     operation: String,
     job_id: Option<String>,

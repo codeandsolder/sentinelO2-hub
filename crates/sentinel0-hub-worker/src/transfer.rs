@@ -21,6 +21,7 @@ pub(super) type AckWaiters =
     std::collections::HashMap<TransferChunkKey, oneshot::Sender<TransferChunkAck>>;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct TransferFileRequest {
     source_host_id: String,
     source_path: String,
