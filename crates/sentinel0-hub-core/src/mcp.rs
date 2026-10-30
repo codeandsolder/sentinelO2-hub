@@ -39,7 +39,7 @@ pub struct McpHubCall {
     pub arguments: Value,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpToolCall {
     Direct(McpDirectCall),
     Hub(McpHubCall),
