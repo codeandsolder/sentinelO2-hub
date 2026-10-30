@@ -8,7 +8,7 @@ use thiserror::Error;
 
 pub const JOB_COMPLETED_EVENT: &str = "job_completed";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobCompletion {
     pub job_id: String,
     pub tool: String,

@@ -329,12 +329,17 @@ async fn serve_agent(state: AppState, socket: WebSocket) {
         }
     }
 
-    let mut sessions = state.hub.sessions.write().await;
-    let is_current = sessions
-        .get(&host_id)
-        .is_some_and(|session| session.session_id == session_id);
+    let is_current = {
+        let mut sessions = state.hub.sessions.write().await;
+        let is_current = sessions
+            .get(&host_id)
+            .is_some_and(|session| session.session_id == session_id);
+        if is_current {
+            sessions.remove(&host_id);
+        }
+        is_current
+    };
     if is_current {
-        sessions.remove(&host_id);
         state.hub.registry.write().await.disconnect(&host_id);
         let store = state
             .hub
@@ -449,24 +454,28 @@ async fn handle_agent_text(state: &AppState, host_id: &str, raw: &str) {
             transfer::handle_transfer_event(state, host_id, &message).await;
             match parse_job_completion(&message) {
                 Ok(Some(completion)) => {
-                    if completion.host_id != host_id {
+                    if completion.host_id == host_id {
+                        let persisted = {
+                            let store = state
+                                .hub
+                                .store
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            store.job_completed(&completion)
+                        };
+                        if let Err(error) = persisted {
+                            warn!(
+                                job_id = %completion.job_id,
+                                %error,
+                                "failed to persist job completion"
+                            );
+                        }
+                    } else {
                         warn!(
                             %host_id,
                             completion_host = %completion.host_id,
                             job_id = %completion.job_id,
                             "discarding job completion whose host does not match its socket"
-                        );
-                    } else if let Err(error) = state
-                        .hub
-                        .store
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .job_completed(&completion)
-                    {
-                        warn!(
-                            job_id = %completion.job_id,
-                            %error,
-                            "failed to persist job completion"
                         );
                     }
                 }
@@ -504,14 +513,18 @@ async fn v1_hosts(State(state): State<AppState>) -> Response {
 }
 
 async fn v1_get_default_host(State(state): State<AppState>) -> Response {
-    let registry = state.hub.registry.read().await;
-    let default_host_id = registry.default_host_id();
-    let is_connected = default_host_id.and_then(|host_id| {
-        registry
-            .hosts()
-            .find(|host| host.host_id == host_id)
-            .map(sentinel0_hub_core::HostRecord::eligible)
-    });
+    let (default_host_id, is_connected) = {
+        let registry = state.hub.registry.read().await;
+        let default_host_id = registry.default_host_id().map(str::to_owned);
+        let is_connected = default_host_id.as_deref().and_then(|host_id| {
+            registry
+                .hosts()
+                .find(|host| host.host_id == host_id)
+                .map(sentinel0_hub_core::HostRecord::eligible)
+        });
+        drop(registry);
+        (default_host_id, is_connected)
+    };
     (
         StatusCode::OK,
         Json(json!({
@@ -539,24 +552,26 @@ async fn v1_set_default_host(
                 "unknown host_id".to_owned(),
             );
         };
-        host.connected
+        let connected = host.connected;
+        drop(registry);
+        connected
     };
-    if let Err(error) = state
-        .hub
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .set_default_host(&request.host_id)
-    {
+    let store_result = {
+        let store = state
+            .hub
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.set_default_host(&request.host_id)
+    };
+    if let Err(error) = store_result {
         return store_error_response(&error);
     }
-    if let Err(error) = state
-        .hub
-        .registry
-        .write()
-        .await
-        .set_default(&request.host_id)
-    {
+    let registry_result = {
+        let mut registry = state.hub.registry.write().await;
+        registry.set_default(&request.host_id)
+    };
+    if let Err(error) = registry_result {
         return host_mutation_error(&error);
     }
     (
@@ -571,13 +586,15 @@ async fn v1_set_default_host(
 }
 
 async fn v1_clear_default_host(State(state): State<AppState>) -> Response {
-    let removed = match state
-        .hub
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clear_default_host()
-    {
+    let clear_result = {
+        let store = state
+            .hub
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.clear_default_host()
+    };
+    let removed = match clear_result {
         Ok(removed) => removed,
         Err(error) => return store_error_response(&error),
     };
@@ -607,13 +624,15 @@ async fn v1_set_host_label(
             );
         }
     }
-    if let Err(error) = state
-        .hub
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .set_host_label(&request.host_id, label.as_deref())
-    {
+    let store_result = {
+        let store = state
+            .hub
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.set_host_label(&request.host_id, label.as_deref())
+    };
+    if let Err(error) = store_result {
         return match error {
             StoreError::LabelConflict(owner) => api_error(
                 StatusCode::CONFLICT,
@@ -623,13 +642,11 @@ async fn v1_set_host_label(
             other => store_error_response(&other),
         };
     }
-    if let Err(error) = state
-        .hub
-        .registry
-        .write()
-        .await
-        .set_label(&request.host_id, label.clone())
-    {
+    let registry_result = {
+        let mut registry = state.hub.registry.write().await;
+        registry.set_label(&request.host_id, label.clone())
+    };
+    if let Err(error) = registry_result {
         return host_mutation_error(&error);
     }
     (
@@ -653,22 +670,22 @@ async fn v1_set_host_disabled(
             );
         }
     }
-    if let Err(error) = state
-        .hub
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .set_host_disabled(&request.host_id, request.disabled)
-    {
+    let store_result = {
+        let store = state
+            .hub
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.set_host_disabled(&request.host_id, request.disabled)
+    };
+    if let Err(error) = store_result {
         return store_error_response(&error);
     }
-    if let Err(error) = state
-        .hub
-        .registry
-        .write()
-        .await
-        .set_disabled(&request.host_id, request.disabled)
-    {
+    let registry_result = {
+        let mut registry = state.hub.registry.write().await;
+        registry.set_disabled(&request.host_id, request.disabled)
+    };
+    if let Err(error) = registry_result {
         return host_mutation_error(&error);
     }
     if request.disabled {
@@ -1044,26 +1061,30 @@ fn persist_terminal_request_error(
         "hub_request_id": hub_request_id,
         "replayed": false,
     });
-    if let Err(error) = state
-        .hub
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .complete_idempotency(client_request_id, hub_request_id, status.as_u16(), &body)
-    {
+    let persisted = {
+        let store = state
+            .hub
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.complete_idempotency(client_request_id, hub_request_id, status.as_u16(), &body)
+    };
+    if let Err(error) = persisted {
         warn!(%hub_request_id, %error, "failed to persist terminal request error");
     }
 }
 
 fn value_response(status: u16, body: Value) -> Response {
-    match StatusCode::from_u16(status) {
-        Ok(status) => (status, Json(body)).into_response(),
-        Err(_) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "store_error",
-            "stored idempotency response has invalid HTTP status".to_owned(),
-        ),
-    }
+    StatusCode::from_u16(status).map_or_else(
+        |_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "store_error",
+                "stored idempotency response has invalid HTTP status".to_owned(),
+            )
+        },
+        |status| (status, Json(body)).into_response(),
+    )
 }
 
 fn host_mutation_error(error: &HostResolutionError) -> Response {

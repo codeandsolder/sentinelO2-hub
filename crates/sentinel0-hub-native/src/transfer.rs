@@ -17,14 +17,13 @@ use tokio::sync::oneshot;
 use tracing::warn;
 use uuid::Uuid;
 
-pub(super) type TransferChunkKey = (String, String, u32);
-pub(super) type BinaryWaiters =
-    std::collections::HashMap<TransferChunkKey, oneshot::Sender<Vec<u8>>>;
-pub(super) type AckWaiters =
+pub type TransferChunkKey = (String, String, u32);
+pub type BinaryWaiters = std::collections::HashMap<TransferChunkKey, oneshot::Sender<Vec<u8>>>;
+pub type AckWaiters =
     std::collections::HashMap<TransferChunkKey, oneshot::Sender<TransferChunkAck>>;
 
 #[derive(Debug, Deserialize)]
-pub(super) struct TransferFileRequest {
+pub struct TransferFileRequest {
     source_host_id: String,
     source_path: String,
     destination_host_id: String,
@@ -77,7 +76,7 @@ impl TransferFailure {
     }
 }
 
-pub(super) async fn v1_transfer_file(
+pub async fn v1_transfer_file(
     State(state): State<AppState>,
     Json(request): Json<TransferFileRequest>,
 ) -> Response {
@@ -106,6 +105,7 @@ async fn transfer_file(
         let registry = state.hub.registry.read().await;
         let source_host_id = resolve_host(&registry, &request.source_host_id)?;
         let destination_host_id = resolve_host(&registry, &request.destination_host_id)?;
+        drop(registry);
         (source_host_id, destination_host_id)
     };
 
@@ -125,6 +125,7 @@ async fn transfer_file(
                 "destination host has no active agent session",
             )
         })?;
+        drop(sessions);
         (source, destination)
     };
 
@@ -298,7 +299,10 @@ async fn transfer_after_source_init(
     }))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "chunk transfer keeps source, destination, plan, index, and trace context explicit"
+)]
 async fn transfer_one_chunk(
     state: &AppState,
     source_host_id: &str,
@@ -410,8 +414,8 @@ fn validate_source_binary(
             StatusCode::BAD_GATEWAY,
             "transfer_protocol_error",
             format!(
-                "source binary metadata mismatch at chunk {index}: frame_index={}, payload_bytes={}, response_bytes={}",
-                frame.chunk_index, payload_bytes, chunk.bytes
+                "source binary metadata mismatch at chunk {index}: frame_index={}, payload_bytes={payload_bytes}, response_bytes={}",
+                frame.chunk_index, chunk.bytes
             ),
         ));
     }
@@ -426,7 +430,6 @@ fn validate_source_binary(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn forward_destination_chunk(
     state: &AppState,
     destination_host_id: &str,
@@ -583,7 +586,7 @@ async fn best_effort_export_cleanup(
     }
 }
 
-pub(super) async fn handle_binary_frame(state: &AppState, host_id: &str, raw: Vec<u8>) {
+pub async fn handle_binary_frame(state: &AppState, host_id: &str, raw: Vec<u8>) {
     let frame = match decode_binary_frame(&raw) {
         Ok(frame) => frame,
         Err(error) => {
@@ -601,7 +604,7 @@ pub(super) async fn handle_binary_frame(state: &AppState, host_id: &str, raw: Ve
     }
 }
 
-pub(super) async fn handle_transfer_event(state: &AppState, host_id: &str, message: &Message) {
+pub async fn handle_transfer_event(state: &AppState, host_id: &str, message: &Message) {
     let ack = match parse_transfer_chunk_ack(message) {
         Ok(Some(ack)) => ack,
         Ok(None) => return,

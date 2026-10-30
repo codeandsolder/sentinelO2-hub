@@ -37,7 +37,7 @@ fn with_host_and_ref(mut fields: Vec<(&'static str, Value)>) -> Vec<(&'static st
 }
 
 #[must_use]
-pub fn direct_tool_description(op: Op) -> &'static str {
+pub const fn direct_tool_description(op: Op) -> &'static str {
     match op {
         Op::Ping => "Simple SentinelX health check.",
         Op::Capabilities => "Get SentinelX capabilities and policy summary for a host.",

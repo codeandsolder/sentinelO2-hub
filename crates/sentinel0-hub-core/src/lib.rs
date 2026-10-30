@@ -61,7 +61,7 @@ pub struct HostRecord {
 
 impl HostRecord {
     #[must_use]
-    pub fn eligible(&self) -> bool {
+    pub const fn eligible(&self) -> bool {
         self.connected && !self.disabled
     }
 }

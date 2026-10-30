@@ -7,7 +7,7 @@ use thiserror::Error;
 
 const IDEMPOTENCY_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum BeginIdempotency {
     Start,
     Conflict,
