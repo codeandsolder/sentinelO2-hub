@@ -1,4 +1,8 @@
 #![forbid(unsafe_code)]
+#![expect(
+    clippy::future_not_send,
+    reason = "Cloudflare Workers and Durable Objects are single-threaded and expose intentionally non-Send JS futures"
+)]
 
 //! Cloudflare Workers + Durable Objects adapter for the Sentinel0² Hub.
 

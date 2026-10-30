@@ -303,7 +303,7 @@ async fn direct_response_to_part(response: Response) -> Value {
     if !(200..300).contains(&status) {
         return value;
     }
-    let response = match serde_json::from_value::<DirectResponse>(value.clone()) {
+    let response = match serde_json::from_value::<DirectResponse>(value) {
         Ok(response) => response,
         Err(error) => {
             return json!({

@@ -23,11 +23,7 @@ use serde_json::{Map, Value, json};
 
 const MCP_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
-pub(super) async fn mcp(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+pub async fn mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let request = match serde_json::from_slice::<McpRequest>(&body) {
         Ok(request) => request,
         Err(error) => {
@@ -274,7 +270,7 @@ async fn direct_response_to_part(response: Response) -> Value {
     if !status.is_success() {
         return value;
     }
-    let response = match serde_json::from_value::<DirectResponse>(value.clone()) {
+    let response = match serde_json::from_value::<DirectResponse>(value) {
         Ok(response) => response,
         Err(error) => {
             return json!({
@@ -315,7 +311,9 @@ async fn remove_host_label(state: AppState, arguments: &Value) -> Value {
         let Some(host) = registry.hosts().find(|host| host.host_id == host_id) else {
             return mcp_tool_error("host_not_found: unknown host_id", None);
         };
-        host.label.is_some()
+        let removed = host.label.is_some();
+        drop(registry);
+        removed
     };
     let response = v1_set_host_label(
         State(state),

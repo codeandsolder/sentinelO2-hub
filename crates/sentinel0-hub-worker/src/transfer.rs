@@ -14,15 +14,14 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, fmt::Write as _, time::Duration};
 use worker::{Delay, Response, Result, WebSocket, console_warn};
 
-pub(super) type TransferChunkKey = (String, String, u32);
-pub(super) type BinaryWaiters =
-    std::collections::HashMap<TransferChunkKey, oneshot::Sender<Vec<u8>>>;
-pub(super) type AckWaiters =
+pub type TransferChunkKey = (String, String, u32);
+pub type BinaryWaiters = std::collections::HashMap<TransferChunkKey, oneshot::Sender<Vec<u8>>>;
+pub type AckWaiters =
     std::collections::HashMap<TransferChunkKey, oneshot::Sender<TransferChunkAck>>;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct TransferFileRequest {
+pub struct TransferFileRequest {
     source_host_id: String,
     source_path: String,
     destination_host_id: String,
@@ -581,8 +580,8 @@ fn validate_source_binary(
             502,
             "transfer_protocol_error",
             format!(
-                "source binary metadata mismatch at chunk {index}: frame_index={}, payload_bytes={}, response_bytes={}",
-                frame.chunk_index, payload_bytes, chunk.bytes
+                "source binary metadata mismatch at chunk {index}: frame_index={}, payload_bytes={payload_bytes}, response_bytes={}",
+                frame.chunk_index, chunk.bytes
             ),
         ));
     }
