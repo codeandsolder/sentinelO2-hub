@@ -363,9 +363,8 @@ mod tests {
             "timestamp": "2026-10-07T00:00:00Z"
         }))
         .map_err(|error| TransferProtocolError::InvalidPlan(error.to_string()))?;
-        let ack = parse_transfer_chunk_ack(&message)?.ok_or(TransferProtocolError::InvalidPlan(
-            "missing parsed ack".to_owned(),
-        ))?;
+        let ack = parse_transfer_chunk_ack(&message)?
+            .ok_or_else(|| TransferProtocolError::InvalidPlan("missing parsed ack".to_owned()))?;
         assert_eq!(ack.chunk_index, 7);
         assert_eq!(ack.bytes, Some(123));
         Ok(())
