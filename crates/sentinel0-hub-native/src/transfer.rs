@@ -298,7 +298,10 @@ async fn transfer_after_source_init(
     }))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "chunk transfer keeps source, destination, plan, index, and trace context explicit"
+)]
 async fn transfer_one_chunk(
     state: &AppState,
     source_host_id: &str,
@@ -426,7 +429,10 @@ fn validate_source_binary(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "destination forwarding keeps transfer-plan and acknowledgment context explicit"
+)]
 async fn forward_destination_chunk(
     state: &AppState,
     destination_host_id: &str,

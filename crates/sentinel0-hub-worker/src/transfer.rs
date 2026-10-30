@@ -164,7 +164,10 @@ impl TenantHub {
         result
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "transfer orchestration keeps request, endpoints, sockets, and plan context explicit"
+    )]
     async fn transfer_after_source_init(
         &self,
         request: &TransferFileRequest,
@@ -270,7 +273,10 @@ impl TenantHub {
         }))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "chunk transfer keeps source, destination, plan, index, and trace context explicit"
+    )]
     async fn transfer_one_chunk(
         &self,
         source_host_id: &str,
@@ -358,7 +364,10 @@ impl TenantHub {
         Ok((binary, chunk))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "destination forwarding keeps transfer-plan and acknowledgment context explicit"
+    )]
     async fn forward_destination_chunk(
         &self,
         destination_host_id: &str,

@@ -44,7 +44,10 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[allow(clippy::struct_field_names)] // IDs are distinct protocol/session concepts.
+#[expect(
+    clippy::struct_field_names,
+    reason = "IDs are distinct protocol and session concepts"
+)]
 struct SocketAttachment {
     connection_id: Option<String>,
     host_id: Option<String>,
@@ -241,7 +244,10 @@ impl DurableObject for TenantHub {
         }
     }
 
-    #[allow(clippy::unused_async_trait_impl)] // DurableObject requires async event handlers.
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "DurableObject requires async event-handler trait methods"
+    )]
     async fn websocket_message(
         &self,
         ws: WebSocket,
@@ -319,7 +325,10 @@ impl DurableObject for TenantHub {
         Ok(())
     }
 
-    #[allow(clippy::unused_async_trait_impl)] // DurableObject requires async event handlers.
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "DurableObject requires async event-handler trait methods"
+    )]
     async fn websocket_close(
         &self,
         ws: WebSocket,
@@ -348,7 +357,10 @@ impl DurableObject for TenantHub {
         Ok(())
     }
 
-    #[allow(clippy::unused_async_trait_impl)] // DurableObject requires async event handlers.
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "DurableObject requires async event-handler trait methods"
+    )]
     async fn websocket_error(&self, ws: WebSocket, error: Error) -> Result<()> {
         let attachment = self.resolve_attachment(&ws)?;
         console_warn!("agent socket error host={:?}: {error}", attachment.host_id);
