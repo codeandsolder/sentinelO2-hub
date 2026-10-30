@@ -24,7 +24,7 @@ pub struct McpRequest {
     pub params: Value,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpDirectCall {
     pub tool_name: String,
     pub op_name: String,
@@ -32,7 +32,7 @@ pub struct McpDirectCall {
     pub payload: Value,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpHubCall {
     pub tool_name: String,
     pub kind: HubToolKind,

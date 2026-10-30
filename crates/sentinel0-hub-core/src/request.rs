@@ -22,7 +22,7 @@ pub struct DirectRequestInput {
     pub client_request_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedDirectRequest {
     pub op: Op,
     pub host_id: String,
@@ -148,7 +148,7 @@ pub fn prepare_protocol_request(
     })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DirectResponse {
     pub ok: bool,
     pub result: Option<BTreeMap<String, Value>>,
@@ -160,7 +160,7 @@ pub struct DirectResponse {
 
 impl DirectResponse {
     #[must_use]
-    pub fn replayed(mut self) -> Self {
+    pub const fn replayed(mut self) -> Self {
         self.replayed = true;
         self
     }

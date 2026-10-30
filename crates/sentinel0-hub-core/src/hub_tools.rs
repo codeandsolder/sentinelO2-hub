@@ -335,7 +335,7 @@ pub fn hub_tool_input_schema(kind: HubToolKind) -> Value {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubProtocolCall {
     pub op: Op,
     pub host_selector: Option<String>,
@@ -350,7 +350,7 @@ pub enum HubToolArgumentError {
     InvalidHostSelector,
 }
 
-fn protocol_operation(kind: HubToolKind) -> Option<(Op, &'static str, &'static str)> {
+const fn protocol_operation(kind: HubToolKind) -> Option<(Op, &'static str, &'static str)> {
     match kind {
         HubToolKind::GitDiff => Some((Op::Git, "operation", "diff")),
         HubToolKind::GitApplyPatch => Some((Op::Git, "operation", "apply_patch")),

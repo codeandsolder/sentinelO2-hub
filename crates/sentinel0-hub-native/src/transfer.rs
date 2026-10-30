@@ -429,10 +429,6 @@ fn validate_source_binary(
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "destination forwarding keeps transfer-plan and acknowledgment context explicit"
-)]
 async fn forward_destination_chunk(
     state: &AppState,
     destination_host_id: &str,
