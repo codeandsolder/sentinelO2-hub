@@ -17,7 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 sentinel0-hub-core = { path = "../sentinel0-hub-core" }
 sentinel0-proto.workspace = true
-worker = "0.8.7"
+worker = "0.9.0"
 
 [lints]
 workspace = true
