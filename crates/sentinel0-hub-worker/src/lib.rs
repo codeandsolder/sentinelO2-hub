@@ -164,9 +164,15 @@ struct IdempotencyRequestRow {
     client_request_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DbColumnRow {
+    name: String,
+}
+
 struct PendingRequest {
     waiter: oneshot::Sender<Message>,
     client_request_id: Option<String>,
+    host_id: String,
 }
 
 #[durable_object]
@@ -289,6 +295,12 @@ impl DurableObject for TenantHub {
 
         match message {
             Message::Response { ref id, .. } => {
+                if self.pending.borrow().get(id).is_some_and(|pending| {
+                    attachment.host_id.as_deref() != Some(pending.host_id.as_str())
+                }) {
+                    console_warn!("discarding response {id} from unexpected host");
+                    return Ok(());
+                }
                 if let Some(pending) = self.pending.borrow_mut().remove(id) {
                     if let Some(client_request_id) = pending.client_request_id.as_deref()
                         && let Err(error) = self.persist_idempotent_agent_response_for_client(
@@ -300,7 +312,11 @@ impl DurableObject for TenantHub {
                         console_warn!("failed to persist idempotent response {id}: {error}");
                     }
                     let _ = pending.waiter.send(message);
-                } else if let Err(error) = self.persist_idempotent_agent_response(id, &message) {
+                } else if let Err(error) = self.persist_idempotent_agent_response(
+                    id,
+                    attachment.host_id.as_deref().unwrap_or_default(),
+                    &message,
+                ) {
                     console_warn!("failed to persist late idempotent response {id}: {error}");
                 }
             }
@@ -434,6 +450,7 @@ impl TenantHub {
                 fingerprint TEXT NOT NULL,\
                 state TEXT NOT NULL CHECK (state IN ('pending', 'complete')),\
                 hub_request_id TEXT NOT NULL UNIQUE,\
+                host_id TEXT NOT NULL,\
                 response_json TEXT,\
                 http_status INTEGER,\
                 created_ms INTEGER NOT NULL,\
@@ -441,6 +458,19 @@ impl TenantHub {
             )",
             None::<Vec<SqlStorageValue>>,
         )?;
+        // Existing Durable Objects may have the old idempotency schema.
+        let columns = sql
+            .exec(
+                "PRAGMA table_info(idempotency)",
+                None::<Vec<SqlStorageValue>>,
+            )?
+            .to_array::<DbColumnRow>()?;
+        if !columns.iter().any(|row| row.name == "host_id") {
+            sql.exec(
+                "ALTER TABLE idempotency ADD COLUMN host_id TEXT NOT NULL DEFAULT ''",
+                None::<Vec<SqlStorageValue>>,
+            )?;
+        }
         sql.exec(
             "CREATE INDEX IF NOT EXISTS idempotency_expires_idx ON idempotency(expires_ms)",
             None::<Vec<SqlStorageValue>>,
@@ -761,9 +791,12 @@ impl TenantHub {
         if let (Some(client_request_id), Some(fingerprint)) = (
             prepared.client_request_id.as_deref(),
             prepared.invocation_fingerprint.as_deref(),
-        ) && let Some(response) =
-            self.begin_idempotency(client_request_id, fingerprint, &request_id)?
-        {
+        ) && let Some(response) = self.begin_idempotency(
+            client_request_id,
+            fingerprint,
+            &request_id,
+            &prepared.host_id,
+        )? {
             return Ok(response);
         }
 
@@ -778,6 +811,7 @@ impl TenantHub {
             PendingRequest {
                 waiter: tx,
                 client_request_id: prepared.client_request_id.clone(),
+                host_id: prepared.host_id.clone(),
             },
         );
         if let Err(error) = socket.send(&wire) {
@@ -899,8 +933,9 @@ impl TenantHub {
         client_request_id: &str,
         fingerprint: &str,
         request_id: &str,
+        host_id: &str,
     ) -> Result<Option<Response>> {
-        match self.begin_idempotency_inner(client_request_id, fingerprint, request_id) {
+        match self.begin_idempotency_inner(client_request_id, fingerprint, request_id, host_id) {
             Ok(response) => Ok(response),
             Err(error) => {
                 console_warn!("idempotency storage unavailable: {error}");
@@ -918,6 +953,7 @@ impl TenantHub {
         client_request_id: &str,
         fingerprint: &str,
         request_id: &str,
+        host_id: &str,
     ) -> Result<Option<Response>> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let sql = self.state.storage().sql();
@@ -983,13 +1019,14 @@ impl TenantHub {
 
         sql.exec(
             "INSERT INTO idempotency (\
-                client_request_id, fingerprint, state, hub_request_id, \
+                client_request_id, fingerprint, state, hub_request_id, host_id, \
                 response_json, http_status, created_ms, expires_ms\
-             ) VALUES (?, ?, 'pending', ?, NULL, NULL, ?, ?)",
+             ) VALUES (?, ?, 'pending', ?, ?, NULL, NULL, ?, ?)",
             vec![
                 client_request_id.into(),
                 fingerprint.into(),
                 request_id.into(),
+                host_id.into(),
                 now_ms.into(),
                 (now_ms + IDEMPOTENCY_TTL_MS).into(),
             ],
@@ -1011,15 +1048,20 @@ impl TenantHub {
         self.complete_idempotency(client_request_id, request_id, 200, &body)
     }
 
-    fn persist_idempotent_agent_response(&self, request_id: &str, message: &Message) -> Result<()> {
+    fn persist_idempotent_agent_response(
+        &self,
+        request_id: &str,
+        host_id: &str,
+        message: &Message,
+    ) -> Result<()> {
         let rows = self
             .state
             .storage()
             .sql()
             .exec(
                 "SELECT client_request_id FROM idempotency \
-                 WHERE hub_request_id = ? AND state = 'pending' LIMIT 1",
-                vec![request_id.into()],
+                 WHERE hub_request_id = ? AND host_id = ? AND state = 'pending' LIMIT 1",
+                vec![request_id.into(), host_id.into()],
             )?
             .to_array::<IdempotencyRequestRow>()?;
         let Some(row) = rows.first() else {

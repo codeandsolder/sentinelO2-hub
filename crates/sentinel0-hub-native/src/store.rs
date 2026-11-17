@@ -98,6 +98,7 @@ impl NativeStore {
                  fingerprint TEXT NOT NULL,
                  state TEXT NOT NULL CHECK (state IN ('pending', 'complete')),
                  hub_request_id TEXT NOT NULL UNIQUE,
+                 host_id TEXT NOT NULL,
                  response_json TEXT,
                  http_status INTEGER,
                  created_ms INTEGER NOT NULL,
@@ -114,6 +115,20 @@ impl NativeStore {
                  acked_ms INTEGER
              );",
         )?;
+        // Existing databases may predate request-to-host correlation.
+        let host_id_column_exists = {
+            let mut columns = connection.prepare("PRAGMA table_info(idempotency)")?;
+            let names = columns
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            names.iter().any(|name| name == "host_id")
+        };
+        if !host_id_column_exists {
+            connection.execute(
+                "ALTER TABLE idempotency ADD COLUMN host_id TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
         let now_ms = Utc::now().timestamp_millis();
         connection.execute(
             "UPDATE jobs SET status = 'orphaned', updated_ms = ?1 WHERE status = 'running'",
@@ -247,6 +262,7 @@ impl NativeStore {
         client_request_id: &str,
         fingerprint: &str,
         hub_request_id: &str,
+        host_id: &str,
     ) -> Result<BeginIdempotency, StoreError> {
         let now_ms = Utc::now().timestamp_millis();
         self.connection.execute(
@@ -310,13 +326,14 @@ impl NativeStore {
 
         self.connection.execute(
             "INSERT INTO idempotency
-                (client_request_id, fingerprint, state, hub_request_id,
+                (client_request_id, fingerprint, state, hub_request_id, host_id,
                  response_json, http_status, created_ms, expires_ms)
-             VALUES (?1, ?2, 'pending', ?3, NULL, NULL, ?4, ?5)",
+             VALUES (?1, ?2, 'pending', ?3, ?4, NULL, NULL, ?5, ?6)",
             params![
                 client_request_id,
                 fingerprint,
                 hub_request_id,
+                host_id,
                 now_ms,
                 now_ms + IDEMPOTENCY_TTL_MS
             ],
@@ -327,13 +344,14 @@ impl NativeStore {
     pub fn pending_client_request_id(
         &self,
         hub_request_id: &str,
+        host_id: &str,
     ) -> Result<Option<String>, StoreError> {
         Ok(self
             .connection
             .query_row(
                 "SELECT client_request_id FROM idempotency
-                 WHERE hub_request_id = ?1 AND state = 'pending' LIMIT 1",
-                params![hub_request_id],
+                 WHERE hub_request_id = ?1 AND host_id = ?2 AND state = 'pending' LIMIT 1",
+                params![hub_request_id, host_id],
                 |row| row.get(0),
             )
             .optional()?)
@@ -603,23 +621,26 @@ mod tests {
     fn idempotency_replays_conflicts_and_tracks_pending() -> Result<(), StoreError> {
         let store = NativeStore::open(":memory:")?;
         assert_eq!(
-            store.begin_idempotency("client_1", "fingerprint_a", "hreq_1")?,
+            store.begin_idempotency("client_1", "fingerprint_a", "hreq_1", "alpha")?,
             BeginIdempotency::Start
         );
         assert_eq!(
-            store.begin_idempotency("client_1", "fingerprint_a", "hreq_2")?,
+            store.begin_idempotency("client_1", "fingerprint_a", "hreq_2", "alpha")?,
             BeginIdempotency::Pending {
                 hub_request_id: "hreq_1".to_owned()
             }
         );
         assert_eq!(
-            store.begin_idempotency("client_1", "fingerprint_b", "hreq_3")?,
+            store.begin_idempotency("client_1", "fingerprint_b", "hreq_3", "alpha")?,
             BeginIdempotency::Conflict
         );
         assert_eq!(
-            store.pending_client_request_id("hreq_1")?.as_deref(),
+            store
+                .pending_client_request_id("hreq_1", "alpha")?
+                .as_deref(),
             Some("client_1")
         );
+        assert_eq!(store.pending_client_request_id("hreq_1", "beta")?, None);
 
         let body = serde_json::json!({
             "ok": true,
@@ -630,7 +651,7 @@ mod tests {
         });
         store.complete_idempotency("client_1", "hreq_1", 200, &body)?;
 
-        match store.begin_idempotency("client_1", "fingerprint_a", "hreq_4")? {
+        match store.begin_idempotency("client_1", "fingerprint_a", "hreq_4", "alpha")? {
             BeginIdempotency::Replay { status, body } => {
                 assert_eq!(status, 200);
                 assert_eq!(body.get("replayed"), Some(&Value::Bool(true)));
@@ -645,6 +666,57 @@ mod tests {
                 )));
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn old_sqlite_schema_migrates_without_trusting_unbound_late_responses() -> Result<(), StoreError>
+    {
+        let path = std::env::temp_dir().join(format!(
+            "sentinel0-hub-idempotency-migration-{}.sqlite3",
+            uuid::Uuid::now_v7().simple()
+        ));
+        {
+            let connection = Connection::open(&path)?;
+            connection.execute_batch(
+                "CREATE TABLE idempotency (
+                    client_request_id TEXT PRIMARY KEY,
+                    fingerprint TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (state IN ('pending', 'complete')),
+                    hub_request_id TEXT NOT NULL UNIQUE,
+                    response_json TEXT,
+                    http_status INTEGER,
+                    created_ms INTEGER NOT NULL,
+                    expires_ms INTEGER NOT NULL
+                );
+                INSERT INTO idempotency
+                    (client_request_id, fingerprint, state, hub_request_id,
+                     response_json, http_status, created_ms, expires_ms)
+                VALUES ('old-client', 'fp', 'pending', 'old-wire',
+                        NULL, NULL, 1, 9223372036854775807);",
+            )?;
+        }
+        {
+            let path = path.to_str().ok_or_else(|| {
+                StoreError::CorruptIdempotency("temporary path is not UTF-8".to_owned())
+            })?;
+            let store = NativeStore::open(path)?;
+            assert_eq!(store.pending_client_request_id("old-wire", "alpha")?, None);
+            assert_eq!(
+                store.begin_idempotency("new-client", "fp", "new-wire", "alpha")?,
+                BeginIdempotency::Start
+            );
+            assert_eq!(
+                store
+                    .pending_client_request_id("new-wire", "alpha")?
+                    .as_deref(),
+                Some("new-client")
+            );
+            assert_eq!(store.pending_client_request_id("new-wire", "beta")?, None);
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
         Ok(())
     }
 
