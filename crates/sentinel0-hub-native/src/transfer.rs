@@ -539,6 +539,7 @@ async fn internal_request(
         PendingRequest {
             waiter: tx,
             client_request_id: None,
+            host_id: session.host_id.clone(),
         },
     );
     if session

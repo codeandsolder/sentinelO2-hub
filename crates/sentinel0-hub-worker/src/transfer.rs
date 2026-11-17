@@ -446,12 +446,24 @@ impl TenantHub {
             deadline: None,
             opaque_ref: opaque_ref.map(str::to_owned),
         };
+        let host_id = socket
+            .deserialize_attachment::<super::SocketAttachment>()
+            .map_err(|error| TransferFailure::new(502, "agent_disconnected", error.to_string()))?
+            .and_then(|attachment| attachment.host_id)
+            .ok_or_else(|| {
+                TransferFailure::new(
+                    502,
+                    "agent_disconnected",
+                    "agent socket has no host identity",
+                )
+            })?;
         let (tx, rx) = oneshot::channel();
         self.pending.borrow_mut().insert(
             request_id.clone(),
             PendingRequest {
                 waiter: tx,
                 client_request_id: None,
+                host_id,
             },
         );
         if let Err(error) = socket.send(&wire) {
