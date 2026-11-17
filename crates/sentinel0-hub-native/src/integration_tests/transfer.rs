@@ -210,6 +210,71 @@ async fn source_chunk(
     Ok(())
 }
 
+/// Model the first source frame independently from the metadata's byte
+/// count, including intentionally inconsistent replies in negative cases.
+async fn first_source_chunk(
+    harness: &mut TransferHarness,
+    transfer_id: &str,
+    payload: &[u8],
+    reported_bytes: u64,
+) -> TestResult<Vec<u8>> {
+    let (request_id, request) = expect_op(&mut harness.source, Op::FileExportChunk).await?;
+    assert_eq!(request["transfer_id"], transfer_id);
+    assert_eq!(request["chunk_index"], 0);
+    let binary = encode_binary_frame(*Uuid::parse_str(transfer_id)?.as_bytes(), 0, payload);
+    harness
+        .source
+        .send(ClientMessage::Binary(binary.clone().into()))
+        .await?;
+    reply(
+        &mut harness.source,
+        request_id,
+        json!({
+            "transfer_id": transfer_id,
+            "chunk_index": 0,
+            "bytes": reported_bytes,
+            "eof": true,
+        }),
+    )
+    .await?;
+    Ok(binary)
+}
+
+async fn assert_first_chunk_forwarded(
+    harness: &mut TransferHarness,
+    transfer_id: &str,
+    payload: &[u8],
+    reported_bytes: u64,
+) -> TestResult {
+    let expected = first_source_chunk(harness, transfer_id, payload, reported_bytes).await?;
+    assert_eq!(read_binary(&mut harness.destination).await?, expected);
+    Ok(())
+}
+
+/// An aborted transfer still has to close its source export session.
+async fn expect_export_cleanup(harness: &mut TransferHarness, transfer_id: &str) -> TestResult {
+    let (request_id, request) = expect_op(&mut harness.source, Op::FileExportComplete).await?;
+    assert_eq!(request["transfer_id"], transfer_id);
+    reply(
+        &mut harness.source,
+        request_id,
+        json!({"transfer_id":transfer_id}),
+    )
+    .await
+}
+
+/// A ping/pong proves no binary frame or upload-completion request was sent
+/// on the destination socket before the failure was reported.
+async fn assert_destination_responsive(harness: &mut TransferHarness) -> TestResult {
+    let timestamp = Utc::now();
+    send_agent(&mut harness.destination, &Message::Ping { timestamp }).await?;
+    assert!(matches!(
+        read_agent(&mut harness.destination).await?,
+        Message::Pong { .. }
+    ));
+    Ok(())
+}
+
 async fn finish_source(
     harness: &mut TransferHarness,
     transfer_id: &str,
@@ -351,37 +416,31 @@ async fn multi_chunk_transfer_forwards_exact_binary_and_digest() -> TestResult {
     Ok(())
 }
 
+/// Invalid source metadata must abort the transfer, release the source
+/// session, and leave the destination WebSocket free of transfer data.
+async fn assert_invalid_first_chunk_rejected(reported_bytes: u64) -> TestResult {
+    let mut harness = start_transfer().await?;
+    let transfer_id = export_init(&mut harness, 4, 4).await?;
+    upload_init(&mut harness, &transfer_id, 4).await?;
+    first_source_chunk(&mut harness, &transfer_id, b"bad", reported_bytes).await?;
+    expect_export_cleanup(&mut harness, &transfer_id).await?;
+
+    let result = finish_http(&mut harness, StatusCode::BAD_GATEWAY).await?;
+    assert_eq!(result["error"], "transfer_protocol_error");
+    assert_destination_responsive(&mut harness).await
+}
+
 #[tokio::test]
 async fn destination_rejection_triggers_source_cleanup() -> TestResult {
     let mut harness = start_transfer().await?;
     let transfer_id = export_init(&mut harness, 4, 4).await?;
     upload_init(&mut harness, &transfer_id, 4).await?;
 
-    let (request_id, request) = expect_op(&mut harness.source, Op::FileExportChunk).await?;
-    assert_eq!(request["chunk_index"], 0);
-    let binary = encode_binary_frame(*Uuid::parse_str(&transfer_id)?.as_bytes(), 0, b"data");
-    harness
-        .source
-        .send(ClientMessage::Binary(binary.clone().into()))
-        .await?;
-    reply(
-        &mut harness.source,
-        request_id,
-        json!({"transfer_id":transfer_id, "chunk_index":0, "bytes":4, "eof":true}),
-    )
-    .await?;
-    assert_eq!(read_binary(&mut harness.destination).await?, binary);
+    assert_first_chunk_forwarded(&mut harness, &transfer_id, b"data", 4).await?;
     acknowledge(&mut harness.destination, &transfer_id, 0, Err("disk_full")).await?;
 
     // Failed destination ingest must not cause source finalization or more chunks.
-    let (request_id, request) = expect_op(&mut harness.source, Op::FileExportComplete).await?;
-    assert_eq!(request["transfer_id"], transfer_id);
-    reply(
-        &mut harness.source,
-        request_id,
-        json!({"transfer_id":transfer_id}),
-    )
-    .await?;
+    expect_export_cleanup(&mut harness, &transfer_id).await?;
     let result = finish_http(&mut harness, StatusCode::BAD_GATEWAY).await?;
     assert_eq!(result["error"], "destination_chunk_rejected");
     assert_eq!(result["message"], "disk_full");
@@ -390,42 +449,8 @@ async fn destination_rejection_triggers_source_cleanup() -> TestResult {
 
 #[tokio::test]
 async fn malformed_source_binary_is_not_forwarded_and_export_is_closed() -> TestResult {
-    let mut harness = start_transfer().await?;
-    let transfer_id = export_init(&mut harness, 4, 4).await?;
-    upload_init(&mut harness, &transfer_id, 4).await?;
-    let (request_id, request) = expect_op(&mut harness.source, Op::FileExportChunk).await?;
-    assert_eq!(request["chunk_index"], 0);
-    let binary = encode_binary_frame(*Uuid::parse_str(&transfer_id)?.as_bytes(), 0, b"bad");
-    harness
-        .source
-        .send(ClientMessage::Binary(binary.into()))
-        .await?;
-    reply(
-        &mut harness.source,
-        request_id,
-        json!({"transfer_id":transfer_id, "chunk_index":0, "bytes":4, "eof":true}),
-    )
-    .await?;
-
-    let (request_id, request) = expect_op(&mut harness.source, Op::FileExportComplete).await?;
-    assert_eq!(request["transfer_id"], transfer_id);
-    reply(
-        &mut harness.source,
-        request_id,
-        json!({"transfer_id":transfer_id}),
-    )
-    .await?;
-    let result = finish_http(&mut harness, StatusCode::BAD_GATEWAY).await?;
-    assert_eq!(result["error"], "transfer_protocol_error");
-
-    // No transfer binary should be emitted on the destination connection.
-    let timestamp = Utc::now();
-    send_agent(&mut harness.destination, &Message::Ping { timestamp }).await?;
-    assert!(matches!(
-        read_agent(&mut harness.destination).await?,
-        Message::Pong { .. }
-    ));
-    Ok(())
+    // The frame contains three bytes while its response declares four.
+    assert_invalid_first_chunk_rejected(4).await
 }
 
 #[tokio::test]
@@ -449,15 +474,7 @@ async fn oversized_export_plan_is_rejected_with_source_cleanup() -> TestResult {
         }),
     )
     .await?;
-    let (request_id, request) = expect_op(&mut harness.source, Op::FileExportComplete).await?;
-    assert_eq!(request["transfer_id"], transfer_id);
-    reply(
-        &mut harness.source,
-        request_id,
-        json!({"transfer_id":transfer_id}),
-    )
-    .await?;
-
+    expect_export_cleanup(&mut harness, &transfer_id).await?;
     let result = finish_http(&mut harness, StatusCode::PAYLOAD_TOO_LARGE).await?;
     assert_eq!(result["error"], "file_too_large");
     Ok(())
@@ -465,43 +482,8 @@ async fn oversized_export_plan_is_rejected_with_source_cleanup() -> TestResult {
 
 #[tokio::test]
 async fn self_consistent_but_wrong_sized_chunk_is_rejected() -> TestResult {
-    let mut harness = start_transfer().await?;
-    let transfer_id = export_init(&mut harness, 4, 4).await?;
-    upload_init(&mut harness, &transfer_id, 4).await?;
-    let (request_id, request) = expect_op(&mut harness.source, Op::FileExportChunk).await?;
-    assert_eq!(request["chunk_index"], 0);
-    let binary = encode_binary_frame(*Uuid::parse_str(&transfer_id)?.as_bytes(), 0, b"bad");
-    harness
-        .source
-        .send(ClientMessage::Binary(binary.into()))
-        .await?;
-    // Unlike a frame/response mismatch, both now agree on three bytes;
-    // only the export plan reveals that the chunk should contain four.
-    reply(
-        &mut harness.source,
-        request_id,
-        json!({"transfer_id":transfer_id, "chunk_index":0, "bytes":3, "eof":true}),
-    )
-    .await?;
-    let (request_id, request) = expect_op(&mut harness.source, Op::FileExportComplete).await?;
-    assert_eq!(request["transfer_id"], transfer_id);
-    reply(
-        &mut harness.source,
-        request_id,
-        json!({"transfer_id":transfer_id}),
-    )
-    .await?;
-    let result = finish_http(&mut harness, StatusCode::BAD_GATEWAY).await?;
-    assert_eq!(result["error"], "transfer_protocol_error");
-
-    // Destination never receives a binary frame or a completion request.
-    let timestamp = Utc::now();
-    send_agent(&mut harness.destination, &Message::Ping { timestamp }).await?;
-    assert!(matches!(
-        read_agent(&mut harness.destination).await?,
-        Message::Pong { .. }
-    ));
-    Ok(())
+    // The frame and response agree on three bytes, contradicting the plan.
+    assert_invalid_first_chunk_rejected(3).await
 }
 
 #[tokio::test]
@@ -509,20 +491,7 @@ async fn empty_file_uses_one_zero_byte_chunk() -> TestResult {
     let mut harness = start_transfer().await?;
     let transfer_id = export_init(&mut harness, 0, 4).await?;
     upload_init(&mut harness, &transfer_id, 0).await?;
-    let (request_id, request) = expect_op(&mut harness.source, Op::FileExportChunk).await?;
-    assert_eq!(request["chunk_index"], 0);
-    let binary = encode_binary_frame(*Uuid::parse_str(&transfer_id)?.as_bytes(), 0, b"");
-    harness
-        .source
-        .send(ClientMessage::Binary(binary.clone().into()))
-        .await?;
-    reply(
-        &mut harness.source,
-        request_id,
-        json!({"transfer_id":transfer_id, "chunk_index":0, "bytes":0, "eof":true}),
-    )
-    .await?;
-    assert_eq!(read_binary(&mut harness.destination).await?, binary);
+    assert_first_chunk_forwarded(&mut harness, &transfer_id, b"", 0).await?;
     acknowledge(&mut harness.destination, &transfer_id, 0, Ok(0)).await?;
 
     let sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
