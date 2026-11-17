@@ -14,9 +14,9 @@ use axum::{
 };
 use sentinel0_hub_core::{
     DirectResponse, HubToolKind, JSONRPC_METHOD_NOT_FOUND, McpHubCall, McpRequest, McpRequestError,
-    McpToolCall, hub_protocol_call, mcp_discover_response, mcp_jsonrpc_error, mcp_jsonrpc_result,
-    mcp_tool_error, mcp_tool_result_from_direct, mcp_tool_success, mcp_tools_list_response,
-    parse_mcp_tool_call, validate_modern_mcp_request,
+    McpToolCall, direct_response_part, hub_protocol_call, mcp_discover_response, mcp_jsonrpc_error,
+    mcp_jsonrpc_result, mcp_tool_error, mcp_tool_result_from_direct, mcp_tool_success,
+    mcp_tools_list_response, parse_mcp_tool_call, validate_modern_mcp_request,
 };
 use sentinel0_proto::Op;
 use serde_json::{Map, Value, json};
@@ -270,35 +270,7 @@ async fn direct_response_to_part(response: Response) -> Value {
     if !status.is_success() {
         return value;
     }
-    let response = match serde_json::from_value::<DirectResponse>(value) {
-        Ok(response) => response,
-        Err(error) => {
-            return json!({
-                "ok": false,
-                "error": "invalid_hub_response",
-                "message": error.to_string(),
-            });
-        }
-    };
-    if response.ok {
-        return response.result.map_or_else(
-            || json!({"ok": true}),
-            |result| {
-                let mut result = result.into_iter().collect::<Map<String, Value>>();
-                result.entry("ok".to_owned()).or_insert(Value::Bool(true));
-                Value::Object(result)
-            },
-        );
-    }
-    match response.error {
-        Some(error) => json!({
-            "ok": false,
-            "error": error.code,
-            "message": error.message,
-            "details": error.details,
-        }),
-        None => json!({"ok": false, "error": "agent_error", "message": "agent operation failed"}),
-    }
+    direct_response_part(value)
 }
 
 async fn remove_host_label(state: AppState, arguments: &Value) -> Value {

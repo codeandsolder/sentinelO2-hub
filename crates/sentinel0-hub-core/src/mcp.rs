@@ -275,6 +275,48 @@ pub fn mcp_tool_error(message: impl Into<String>, structured: Option<Value>) -> 
     result
 }
 
+/// Convert a direct Hub response to the structured payload used by composed
+/// tools, preserving error details and defaulting the success flag only when
+/// the agent omitted it.
+///
+/// Callers must handle non-successful HTTP responses before passing the body.
+///
+/// # Examples
+/// `direct_response_part(json!({"ok": true, "result": {"bytes": 4}}))`
+/// returns `{"ok": true, "bytes": 4}`.
+#[must_use]
+pub fn direct_response_part(value: Value) -> Value {
+    let response = match serde_json::from_value::<DirectResponse>(value) {
+        Ok(response) => response,
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "error": "invalid_hub_response",
+                "message": error.to_string(),
+            });
+        }
+    };
+    if response.ok {
+        return response.result.map_or_else(
+            || json!({"ok": true}),
+            |result| {
+                let mut result = result.into_iter().collect::<Map<String, Value>>();
+                result.entry("ok".to_owned()).or_insert(Value::Bool(true));
+                Value::Object(result)
+            },
+        );
+    }
+    match response.error {
+        Some(error) => json!({
+            "ok": false,
+            "error": error.code,
+            "message": error.message,
+            "details": error.details,
+        }),
+        None => json!({"ok": false, "error": "agent_error", "message": "agent operation failed"}),
+    }
+}
+
 #[must_use]
 pub fn mcp_tool_result_from_direct(response: &DirectResponse) -> Value {
     if response.ok {
@@ -323,6 +365,44 @@ mod tests {
             method: method.to_owned(),
             params,
         }
+    }
+
+    fn composed_part_with_envelope(mut response: Value) -> Value {
+        if let Some(fields) = response.as_object_mut() {
+            fields.insert("hub_request_id".to_owned(), json!("hreq"));
+            fields.insert("replayed".to_owned(), json!(false));
+        }
+        direct_response_part(response)
+    }
+
+    #[test]
+    fn composed_direct_response_preserves_success_and_errors() {
+        assert_eq!(
+            composed_part_with_envelope(json!({"ok": true, "result": {"size": 7}})),
+            json!({"ok": true, "size": 7})
+        );
+        assert_eq!(
+            composed_part_with_envelope(json!({"ok": true, "result": {"ok": false}})),
+            json!({"ok": false})
+        );
+        assert_eq!(
+            composed_part_with_envelope(json!({"ok": true, "result": null})),
+            json!({"ok": true})
+        );
+        assert_eq!(
+            composed_part_with_envelope(
+                json!({"ok": false, "error": {"code": "failed", "message": "no", "details": {"which": 3}}})
+            ),
+            json!({"ok": false, "error": "failed", "message": "no", "details": {"which": 3}})
+        );
+        assert_eq!(
+            composed_part_with_envelope(json!({"ok": false})),
+            json!({"ok": false, "error": "agent_error", "message": "agent operation failed"})
+        );
+        assert_eq!(
+            composed_part_with_envelope(json!({"unrecognised": true}))["error"],
+            "invalid_hub_response"
+        );
     }
 
     #[test]

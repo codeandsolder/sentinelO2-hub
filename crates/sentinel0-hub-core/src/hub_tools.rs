@@ -1,6 +1,7 @@
+use crate::schema::object_schema;
 use crate::{DIRECT_TOOLS, direct_tool_catalog};
 use sentinel0_proto::Op;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,22 +168,6 @@ pub const fn hub_tool_description(kind: HubToolKind) -> &'static str {
             "Clear one already-read notification, or all with job_id=\"all\"."
         }
     }
-}
-
-fn object_schema(
-    required: &[&str],
-    properties: impl IntoIterator<Item = (&'static str, Value)>,
-) -> Value {
-    let mut props = Map::new();
-    for (name, schema) in properties {
-        props.insert(name.to_owned(), schema);
-    }
-    json!({
-        "type": "object",
-        "properties": props,
-        "required": required,
-        "additionalProperties": false
-    })
 }
 
 fn nullable_string() -> Value {

@@ -4,14 +4,15 @@ use super::{PendingRequest, TenantHub, json_error};
 use futures_channel::oneshot;
 use futures_util::future::{Either, select};
 use sentinel0_hub_core::{
-    ExportChunkResult, ExportPlan, HostRegistry, HostResolutionError, TransferChunkAck,
-    TransferProtocolError, parse_export_chunk_result, parse_export_digest, parse_export_plan,
-    parse_transfer_chunk_ack, parse_upload_result, validate_export_chunk_binary,
-    validate_upload_init,
+    ExportChunkResult, ExportPlan, HostRegistry, HostResolutionError, TransferAckError,
+    TransferChunkAck, TransferProtocolError, export_complete_payload, parse_export_chunk_result,
+    parse_export_digest, parse_export_plan, parse_transfer_chunk_ack, parse_upload_result,
+    transfer_success_result, upload_complete_payload, upload_init_payload,
+    validate_destination_chunk_ack, validate_export_chunk_binary, validate_upload_init,
 };
 use sentinel0_proto::{Message, Op, TRANSFER_CHUNK_BYTES, decode_binary_frame};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{collections::BTreeMap, fmt::Write as _, time::Duration};
 use worker::{Delay, Response, Result, WebSocket, console_warn};
 
@@ -195,23 +196,12 @@ impl TenantHub {
             .transfer_internal_request(
                 destination,
                 Op::UploadInit,
-                BTreeMap::from([
-                    (
-                        "upload_id".to_owned(),
-                        Value::String(plan.transfer_id.clone()),
-                    ),
-                    (
-                        "target_path".to_owned(),
-                        Value::String(request.destination_path.clone()),
-                    ),
-                    ("total_size".to_owned(), Value::from(plan.size)),
-                    ("overwrite".to_owned(), Value::Bool(request.overwrite)),
-                    (
-                        "land_in_place".to_owned(),
-                        Value::Bool(request.land_in_place),
-                    ),
-                    ("filename".to_owned(), Value::String(plan.filename.clone())),
-                ]),
+                upload_init_payload(
+                    plan,
+                    &request.destination_path,
+                    request.overwrite,
+                    request.land_in_place,
+                ),
                 request.opaque_ref.as_deref(),
             )
             .await?;
@@ -242,10 +232,7 @@ impl TenantHub {
             .transfer_internal_request(
                 source,
                 Op::FileExportComplete,
-                BTreeMap::from([(
-                    "transfer_id".to_owned(),
-                    Value::String(plan.transfer_id.clone()),
-                )]),
+                export_complete_payload(plan),
                 request.opaque_ref.as_deref(),
             )
             .await?;
@@ -256,13 +243,7 @@ impl TenantHub {
             .transfer_internal_request(
                 destination,
                 Op::UploadComplete,
-                BTreeMap::from([
-                    (
-                        "upload_id".to_owned(),
-                        Value::String(plan.transfer_id.clone()),
-                    ),
-                    ("sha256".to_owned(), Value::String(digest.sha256.clone())),
-                ]),
+                upload_complete_payload(plan, &digest),
                 request.opaque_ref.as_deref(),
             )
             .await?;
@@ -274,17 +255,13 @@ impl TenantHub {
         )
         .map_err(TransferFailure::protocol)?;
 
-        Ok(json!({
-            "ok": true,
-            "transfer_id": plan.transfer_id,
-            "source_host_id": source_host_id,
-            "destination_host_id": destination_host_id,
-            "source_path": request.source_path,
-            "destination_path": upload.target_path,
-            "size": upload.size,
-            "sha256": upload.sha256,
-            "chunks": plan.num_chunks,
-        }))
+        Ok(transfer_success_result(
+            plan,
+            source_host_id,
+            destination_host_id,
+            &request.source_path,
+            &upload,
+        ))
     }
 
     #[expect(
@@ -423,24 +400,13 @@ impl TenantHub {
                 ));
             }
         };
-        if !ack.ok {
-            return Err(TransferFailure::new(
-                502,
-                "destination_chunk_rejected",
-                ack.error
-                    .unwrap_or_else(|| "destination rejected chunk".to_owned()),
-            ));
-        }
-        if ack.bytes != Some(expected_bytes) {
-            return Err(TransferFailure::new(
-                502,
-                "transfer_protocol_error",
-                format!(
-                    "destination acknowledged {:?} bytes for chunk {index}, expected {expected_bytes}",
-                    ack.bytes
-                ),
-            ));
-        }
+        validate_destination_chunk_ack(&ack, index, expected_bytes).map_err(|error| {
+            let code = match error {
+                TransferAckError::Rejected(_) => "destination_chunk_rejected",
+                TransferAckError::IncorrectBytes { .. } => "transfer_protocol_error",
+            };
+            TransferFailure::new(502, code, error.to_string())
+        })?;
         Ok(())
     }
 

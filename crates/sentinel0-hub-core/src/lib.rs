@@ -17,6 +17,7 @@ mod hub_tools;
 mod jobs;
 mod mcp;
 mod request;
+mod schema;
 mod tooling;
 mod transfer;
 
@@ -29,9 +30,9 @@ pub use jobs::{JOB_COMPLETED_EVENT, JobCompletion, JobEventError, parse_job_comp
 pub use mcp::{
     JSONRPC_INVALID_PARAMS, JSONRPC_INVALID_REQUEST, JSONRPC_METHOD_NOT_FOUND, MCP_HEADER_MISMATCH,
     MCP_PROTOCOL_VERSION, McpDirectCall, McpHubCall, McpRequest, McpRequestError, McpToolCall,
-    mcp_discover_response, mcp_jsonrpc_error, mcp_jsonrpc_result, mcp_response_meta,
-    mcp_server_info, mcp_tool_error, mcp_tool_result_from_direct, mcp_tool_success,
-    mcp_tools_list_response, parse_mcp_direct_call, parse_mcp_tool_call,
+    direct_response_part, mcp_discover_response, mcp_jsonrpc_error, mcp_jsonrpc_result,
+    mcp_response_meta, mcp_server_info, mcp_tool_error, mcp_tool_result_from_direct,
+    mcp_tool_success, mcp_tools_list_response, parse_mcp_direct_call, parse_mcp_tool_call,
     validate_modern_mcp_request,
 };
 pub use request::{
@@ -44,8 +45,10 @@ pub use tooling::{
 };
 pub use transfer::{
     ExportChunkResult, ExportDigest, ExportPlan, HUB_TRANSFER_MAX_BYTES, TRANSFER_CHUNK_ACK_EVENT,
-    TransferChunkAck, TransferProtocolError, UploadResult, parse_export_chunk_result,
-    parse_export_digest, parse_export_plan, parse_transfer_chunk_ack, parse_upload_result,
+    TransferAckError, TransferChunkAck, TransferProtocolError, UploadResult,
+    export_complete_payload, parse_export_chunk_result, parse_export_digest, parse_export_plan,
+    parse_transfer_chunk_ack, parse_upload_result, transfer_success_result,
+    upload_complete_payload, upload_init_payload, validate_destination_chunk_ack,
     validate_export_chunk_binary, validate_upload_init,
 };
 
