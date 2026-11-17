@@ -2,7 +2,7 @@
 
 use serde_json::{Map, Value, json};
 
-pub(crate) fn object_schema(
+pub fn object_schema(
     required: &[&str],
     properties: impl IntoIterator<Item = (&'static str, Value)>,
 ) -> Value {
