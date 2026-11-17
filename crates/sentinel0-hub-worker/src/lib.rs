@@ -1405,12 +1405,21 @@ impl TenantHub {
         }))
     }
 
-    fn set_default_host(&self, host_id: &str) -> Result<Response> {
+    /// Look up a registered host and its current socket snapshot once per
+    /// mutation. Offline hosts remain valid targets; unknown IDs do not.
+    fn known_host_sockets(&self, host_id: &str) -> Result<Option<HashMap<String, WebSocket>>> {
         let live = self.live_sockets()?;
         let registry = self.load_registry(&live)?;
-        if !registry.hosts().any(|host| host.host_id == host_id) {
+        Ok(registry
+            .hosts()
+            .any(|host| host.host_id == host_id)
+            .then_some(live))
+    }
+
+    fn set_default_host(&self, host_id: &str) -> Result<Response> {
+        let Some(live) = self.known_host_sockets(host_id)? else {
             return json_error(404, "host_not_found", "unknown host_id");
-        }
+        };
         self.state.storage().sql().exec(
             "INSERT INTO tenant_settings (key, value) VALUES (?, ?) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1435,9 +1444,7 @@ impl TenantHub {
     }
 
     fn set_host_label(&self, host_id: &str, label: Option<String>) -> Result<Response> {
-        let live = self.live_sockets()?;
-        let registry = self.load_registry(&live)?;
-        if !registry.hosts().any(|host| host.host_id == host_id) {
+        if self.known_host_sockets(host_id)?.is_none() {
             return json_error(404, "host_not_found", "unknown host_id");
         }
         let label = label
@@ -1473,11 +1480,9 @@ impl TenantHub {
     }
 
     fn set_host_disabled(&self, host_id: &str, disabled: bool) -> Result<Response> {
-        let live = self.live_sockets()?;
-        let registry = self.load_registry(&live)?;
-        if !registry.hosts().any(|host| host.host_id == host_id) {
+        let Some(live) = self.known_host_sockets(host_id)? else {
             return json_error(404, "host_not_found", "unknown host_id");
-        }
+        };
         self.state.storage().sql().exec(
             "UPDATE hosts SET disabled = ? WHERE host_id = ?",
             vec![disabled.into(), host_id.into()],
