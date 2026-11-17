@@ -299,7 +299,9 @@ async fn serve_agent(state: AppState, socket: WebSocket) {
         },
     );
     if let Some(superseded) = superseded {
-        let _ = superseded.tx.send(WsMessage::Close(None)).await;
+        // A full old-session queue must not delay the new connection's
+        // handshake. Dropping the final sender closes that queue as well.
+        let _ = superseded.tx.try_send(WsMessage::Close(None));
     }
 
     info!(%host_id, %session_id, "agent connected");
@@ -315,6 +317,14 @@ async fn serve_agent(state: AppState, socket: WebSocket) {
                 }
             }
             inbound = stream.next() => {
+                // Do not process frames from the superseded connection after a
+                // reconnect, even if its close frame has not arrived yet.
+                let is_current = state.hub.sessions.read().await
+                    .get(&host_id)
+                    .is_some_and(|session| session.session_id == session_id);
+                if !is_current {
+                    break;
+                }
                 match inbound {
                     Some(Ok(WsMessage::Text(raw))) => {
                         handle_agent_text(&state, &host_id, &raw).await;

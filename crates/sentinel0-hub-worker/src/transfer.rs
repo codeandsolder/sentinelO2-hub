@@ -101,6 +101,13 @@ impl TenantHub {
         })?;
         let source_host_id = resolve_host(&registry, &request.source_host_id)?;
         let destination_host_id = resolve_host(&registry, &request.destination_host_id)?;
+        if source_host_id == destination_host_id {
+            return Err(TransferFailure::new(
+                400,
+                "same_host",
+                "source and destination must be different hosts",
+            ));
+        }
         let source = live.get(&source_host_id).cloned().ok_or_else(|| {
             TransferFailure::new(
                 502,
