@@ -410,7 +410,8 @@ impl NativeStore {
                  status = excluded.status,
                  completion_json = excluded.completion_json,
                  updated_ms = excluded.updated_ms
-             WHERE jobs.host_id = excluded.host_id",
+             WHERE jobs.host_id = excluded.host_id
+               AND jobs.completion_json IS NULL",
             params![
                 completion.job_id,
                 completion.host_id,
@@ -424,7 +425,7 @@ impl NativeStore {
             "INSERT INTO notifications
                 (notification_id, kind, ref_id, summary_json, created_ms, read_ms, acked_ms)
              VALUES (?1, 'job_completed', ?2, ?3, ?4, NULL, NULL)
-             ON CONFLICT(notification_id) DO UPDATE SET summary_json = excluded.summary_json",
+             ON CONFLICT(notification_id) DO NOTHING",
             params![
                 format!("job:{}", completion.job_id),
                 completion.job_id,
@@ -677,9 +678,22 @@ mod tests {
         };
 
         store.job_completed(&completion)?;
+        // Late conflicting replays must not replace the first terminal result
+        // or rewrite the notification that the caller observes.
+        let mut contradictory_replay = completion.clone();
+        contradictory_replay.status = "failed".to_owned();
+        contradictory_replay
+            .data
+            .insert("status".to_owned(), Value::String("failed".to_owned()));
+        contradictory_replay.data.insert(
+            "output".to_owned(),
+            Value::String("stale replay".to_owned()),
+        );
+        store.job_completed(&contradictory_replay)?;
         store.job_completed(&completion)?;
         let completed = store.notifications_check()?;
         assert_eq!(completed.completed.len(), 1);
+        assert_eq!(completed.completed[0]["status"], "succeeded");
         assert_eq!(completed.running.len(), 0);
         assert_eq!(completed.orphaned.len(), 0);
 

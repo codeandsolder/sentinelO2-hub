@@ -258,6 +258,11 @@ impl DurableObject for TenantHub {
         incoming: WebSocketIncomingMessage,
     ) -> Result<()> {
         let attachment = self.resolve_attachment(&ws)?;
+        // A replaced socket may still have queued frames. It must not satisfy
+        // requests or complete jobs for the new session of the same host.
+        if attachment.host_id.is_some() && !self.socket_is_current(&attachment)? {
+            return Ok(());
+        }
         let raw = match incoming {
             WebSocketIncomingMessage::String(raw) => raw,
             WebSocketIncomingMessage::Binary(raw) => {
@@ -1123,7 +1128,7 @@ impl TenantHub {
              VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(job_id) DO UPDATE SET \
                 tool = excluded.tool, status = excluded.status, \
                 completion_json = excluded.completion_json, updated_ms = excluded.updated_ms \
-             WHERE jobs.host_id = excluded.host_id",
+             WHERE jobs.host_id = excluded.host_id AND jobs.completion_json IS NULL",
             vec![
                 completion.job_id.as_str().into(),
                 completion.host_id.as_str().into(),
@@ -1137,8 +1142,7 @@ impl TenantHub {
         let notification_id = format!("job:{}", completion.job_id);
         sql.exec(
             "INSERT INTO notifications (notification_id, kind, ref_id, summary_json, created_ms, read_ms, acked_ms) \
-             VALUES (?, 'job_completed', ?, ?, ?, NULL, NULL) ON CONFLICT(notification_id) DO UPDATE SET \
-                summary_json = excluded.summary_json",
+             VALUES (?, 'job_completed', ?, ?, ?, NULL, NULL) ON CONFLICT(notification_id) DO NOTHING",
             vec![
                 notification_id.into(),
                 completion.job_id.as_str().into(),

@@ -199,31 +199,35 @@ impl HostRegistry {
     /// deterministic.
     pub fn resolve(&self, selector: Option<&str>) -> Result<&HostRecord, HostResolutionError> {
         if let Some(selector) = selector {
-            if let Some(host) = self.hosts.get(selector)
-                && host.eligible()
-            {
-                return Ok(host);
+            if let Some(host) = self.hosts.get(selector) {
+                // An exact ID always wins, including when that host is offline.
+                // Never reinterpret it as the label or hostname of another host.
+                return if host.eligible() {
+                    Ok(host)
+                } else {
+                    Err(HostResolutionError::NotFound(selector.to_owned()))
+                };
             }
 
-            let by_label = self
+            let mut by_label = self
                 .hosts
                 .values()
-                .filter(|host| host.eligible() && host.label.as_deref() == Some(selector))
-                .collect::<Vec<_>>();
-            match by_label.as_slice() {
-                [host] => return Ok(host),
-                [] => {}
-                _ => return Err(HostResolutionError::Ambiguous(selector.to_owned())),
+                .filter(|host| host.eligible() && host.label.as_deref() == Some(selector));
+            if let Some(host) = by_label.next() {
+                return if by_label.next().is_none() {
+                    Ok(host)
+                } else {
+                    Err(HostResolutionError::Ambiguous(selector.to_owned()))
+                };
             }
 
-            let by_hostname = self
+            let mut by_hostname = self
                 .hosts
                 .values()
-                .filter(|host| host.eligible() && host.hostname == selector)
-                .collect::<Vec<_>>();
-            return match by_hostname.as_slice() {
-                [host] => Ok(host),
-                [] => Err(HostResolutionError::NotFound(selector.to_owned())),
+                .filter(|host| host.eligible() && host.hostname == selector);
+            return match (by_hostname.next(), by_hostname.next()) {
+                (Some(host), None) => Ok(host),
+                (None, _) => Err(HostResolutionError::NotFound(selector.to_owned())),
                 _ => Err(HostResolutionError::Ambiguous(selector.to_owned())),
             };
         }
@@ -239,14 +243,10 @@ impl HostRegistry {
             ));
         }
 
-        let eligible = self
-            .hosts
-            .values()
-            .filter(|host| host.eligible())
-            .collect::<Vec<_>>();
-        match eligible.as_slice() {
-            [host] => Ok(host),
-            [] => Err(HostResolutionError::NoEligibleHost),
+        let mut eligible = self.hosts.values().filter(|host| host.eligible());
+        match (eligible.next(), eligible.next()) {
+            (Some(host), None) => Ok(host),
+            (None, _) => Err(HostResolutionError::NoEligibleHost),
             _ => Err(HostResolutionError::AmbiguousDefault),
         }
     }
@@ -532,6 +532,50 @@ mod tests {
         assert_eq!(registry.resolve(Some("build"))?.host_id, "host_b");
         assert_eq!(registry.resolve(Some("beta"))?.host_id, "host_b");
         assert_eq!(registry.resolve(None)?.host_id, "host_a");
+        Ok(())
+    }
+
+    #[test]
+    fn offline_exact_host_id_does_not_fall_back_to_another_hosts_label()
+    -> Result<(), HostResolutionError> {
+        let mut registry = HostRegistry::default();
+        registry.register_hello(&host("host_a", "alpha"));
+        registry.register_hello(&host("host_b", "beta"));
+        registry.set_label("host_b", Some("host_a".to_owned()))?;
+        registry.disconnect("host_a");
+
+        assert_eq!(
+            registry.resolve(Some("host_a")),
+            Err(HostResolutionError::NotFound("host_a".to_owned()))
+        );
+        assert_eq!(registry.resolve(Some("beta"))?.host_id, "host_b");
+        Ok(())
+    }
+
+    #[test]
+    fn selector_ambiguities_are_reported_without_changing_priority()
+    -> Result<(), HostResolutionError> {
+        let mut registry = HostRegistry::default();
+        registry.register_hello(&host("host_a", "shared"));
+        registry.register_hello(&host("host_b", "shared"));
+        registry.set_label("host_a", Some("duplicate".to_owned()))?;
+        registry.set_label("host_b", Some("duplicate".to_owned()))?;
+
+        assert_eq!(
+            registry.resolve(Some("duplicate")),
+            Err(HostResolutionError::Ambiguous("duplicate".to_owned()))
+        );
+        assert_eq!(
+            registry.resolve(Some("shared")),
+            Err(HostResolutionError::Ambiguous("shared".to_owned()))
+        );
+        assert_eq!(
+            registry.resolve(None),
+            Err(HostResolutionError::AmbiguousDefault)
+        );
+        assert_eq!(registry.resolve(Some("host_a"))?.host_id, "host_a");
+        registry.disconnect("host_b");
+        assert_eq!(registry.resolve(Some("duplicate"))?.host_id, "host_a");
         Ok(())
     }
 

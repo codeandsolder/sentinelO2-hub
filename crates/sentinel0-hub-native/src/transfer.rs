@@ -109,6 +109,14 @@ async fn transfer_file(
         (source_host_id, destination_host_id)
     };
 
+    if source_host_id == destination_host_id {
+        return Err(TransferFailure::transport(
+            StatusCode::BAD_REQUEST,
+            "same_host",
+            "source and destination must be different hosts",
+        ));
+    }
+
     let (source, destination) = {
         let sessions = state.hub.sessions.read().await;
         let source = sessions.get(&source_host_id).cloned().ok_or_else(|| {

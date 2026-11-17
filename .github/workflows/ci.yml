@@ -15,13 +15,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.99.1"
+          toolchain: "1.100.0"
           components: clippy,rustfmt
           targets: wasm32-unknown-unknown
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@77dd7bb7dcbb8450e335bbbd1c47591733dc79a4 # main
         with:
-          rust-toolchain: "1.99.1"
+          rust-toolchain: "1.100.0"
       - name: Format
         run: cargo fmt --all --check
       - name: Check
