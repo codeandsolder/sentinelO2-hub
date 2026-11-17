@@ -7,7 +7,8 @@ use axum::{
 use sentinel0_hub_core::{
     ExportChunkResult, ExportPlan, HostRegistry, HostResolutionError, TransferChunkAck,
     TransferProtocolError, parse_export_chunk_result, parse_export_digest, parse_export_plan,
-    parse_transfer_chunk_ack, parse_upload_result, validate_upload_init,
+    parse_transfer_chunk_ack, parse_upload_result, validate_export_chunk_binary,
+    validate_upload_init,
 };
 use sentinel0_proto::{Message, Op, TRANSFER_CHUNK_BYTES, decode_binary_frame};
 use serde::Deserialize;
@@ -156,7 +157,16 @@ async fn transfer_file(
         request.opaque_ref.as_deref(),
     )
     .await?;
-    let plan = parse_export_plan(&init, &transfer_id).map_err(TransferFailure::protocol)?;
+    let plan = match parse_export_plan(&init, &transfer_id) {
+        Ok(plan) => plan,
+        Err(error) => {
+            // The source may have allocated its export session even if its
+            // reported plan is unusable. Always attempt to release it.
+            best_effort_export_cleanup(state, &source, &transfer_id, request.opaque_ref.as_deref())
+                .await;
+            return Err(TransferFailure::protocol(error));
+        }
+    };
 
     let result = transfer_after_source_init(
         state,
@@ -399,43 +409,9 @@ async fn receive_source_chunk(
             ));
         }
     };
-    validate_source_binary(&binary, plan, index, &chunk)?;
+    validate_export_chunk_binary(&binary, plan, index, &chunk)
+        .map_err(TransferFailure::protocol)?;
     Ok((binary, chunk))
-}
-
-fn validate_source_binary(
-    binary: &[u8],
-    plan: &ExportPlan,
-    index: u32,
-    chunk: &ExportChunkResult,
-) -> Result<(), TransferFailure> {
-    let frame = decode_binary_frame(binary).map_err(|error| {
-        TransferFailure::transport(
-            StatusCode::BAD_GATEWAY,
-            "transfer_protocol_error",
-            error.to_string(),
-        )
-    })?;
-    let payload_bytes = u64::try_from(frame.payload.len()).unwrap_or(u64::MAX);
-    if frame.chunk_index != index || payload_bytes != chunk.bytes {
-        return Err(TransferFailure::transport(
-            StatusCode::BAD_GATEWAY,
-            "transfer_protocol_error",
-            format!(
-                "source binary metadata mismatch at chunk {index}: frame_index={}, payload_bytes={payload_bytes}, response_bytes={}",
-                frame.chunk_index, chunk.bytes
-            ),
-        ));
-    }
-    let should_eof = u64::from(index) + 1 == plan.num_chunks;
-    if chunk.eof != should_eof {
-        return Err(TransferFailure::transport(
-            StatusCode::BAD_GATEWAY,
-            "transfer_protocol_error",
-            format!("source eof mismatch at chunk {index}"),
-        ));
-    }
-    Ok(())
 }
 
 async fn forward_destination_chunk(

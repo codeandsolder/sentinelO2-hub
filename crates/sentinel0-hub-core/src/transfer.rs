@@ -1,6 +1,6 @@
 //! Runtime-independent file-transfer protocol validation.
 
-use sentinel0_proto::{Message, ResponseError, TRANSFER_CHUNK_BYTES};
+use sentinel0_proto::{Message, ResponseError, TRANSFER_CHUNK_BYTES, decode_binary_frame};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -67,6 +67,8 @@ pub enum TransferProtocolError {
     TooLarge(u64),
     #[error("invalid transfer plan: {0}")]
     InvalidPlan(String),
+    #[error("invalid source transfer chunk: {0}")]
+    InvalidChunk(String),
 }
 
 fn successful_result(message: &Message) -> Result<&BTreeMap<String, Value>, TransferProtocolError> {
@@ -196,6 +198,71 @@ pub fn parse_export_chunk_result(
         bytes: u64_field(result, "bytes")?,
         eof: bool_field(result, "eof")?,
     })
+}
+
+/// Validate one binary source chunk against its declared response and export plan.
+///
+/// Verifies the transfer identity, sequence index, exact planned byte count,
+/// and EOF marker. This prevents individually self-consistent response/frame
+/// pairs from violating the total file size negotiated at export initiation.
+///
+/// # Errors
+///
+/// Returns [`TransferProtocolError::InvalidChunk`] for malformed binary,
+/// mismatched metadata, out-of-range indices, or incorrect chunk sizes.
+pub fn validate_export_chunk_binary(
+    binary: &[u8],
+    plan: &ExportPlan,
+    index: u32,
+    chunk: &ExportChunkResult,
+) -> Result<(), TransferProtocolError> {
+    let frame = decode_binary_frame(binary)
+        .map_err(|error| TransferProtocolError::InvalidChunk(error.to_string()))?;
+
+    let hex_bytes = plan.transfer_id.as_bytes();
+    let expected_id = hex_bytes.as_chunks::<2>().0.iter().map(|digits| {
+        std::str::from_utf8(digits)
+            .ok()
+            .and_then(|digits| u8::from_str_radix(digits, 16).ok())
+    });
+    if hex_bytes.len() != 32 || !expected_id.eq(frame.transfer_id.into_iter().map(Some)) {
+        return Err(TransferProtocolError::InvalidChunk(
+            "frame transfer_id does not match export plan".to_owned(),
+        ));
+    }
+
+    let ordinal = u64::from(index);
+    if plan.chunk_size == 0 || ordinal >= plan.num_chunks {
+        return Err(TransferProtocolError::InvalidChunk(format!(
+            "chunk index {index} is outside the export plan"
+        )));
+    }
+    let offset = ordinal
+        .checked_mul(plan.chunk_size)
+        .and_then(|value| plan.size.checked_sub(value))
+        .ok_or_else(|| {
+            TransferProtocolError::InvalidChunk("chunk offset exceeds export size".to_owned())
+        })?;
+    let expected_bytes = offset.min(plan.chunk_size);
+    let payload_bytes = u64::try_from(frame.payload.len()).unwrap_or(u64::MAX);
+    if frame.chunk_index != index || payload_bytes != chunk.bytes {
+        return Err(TransferProtocolError::InvalidChunk(format!(
+            "source binary metadata mismatch at chunk {index}: frame_index={}, payload_bytes={payload_bytes}, response_bytes={}",
+            frame.chunk_index, chunk.bytes
+        )));
+    }
+    if chunk.bytes != expected_bytes {
+        return Err(TransferProtocolError::InvalidChunk(format!(
+            "source chunk {index} contains {} bytes, expected {expected_bytes} from export plan",
+            chunk.bytes
+        )));
+    }
+    if chunk.eof != (ordinal + 1 == plan.num_chunks) {
+        return Err(TransferProtocolError::InvalidChunk(format!(
+            "source eof mismatch at chunk {index}"
+        )));
+    }
+    Ok(())
 }
 
 /// Parse a destination agent's asynchronous binary-ingest acknowledgement.
@@ -347,6 +414,115 @@ mod tests {
             parse_export_plan(&message, transfer_id),
             Err(TransferProtocolError::InvalidPlan(_))
         ));
+    }
+
+    #[test]
+    fn binary_chunks_respect_negotiated_size_identity_and_eof() {
+        let transfer_id = [0_u8; 16];
+        let plan = ExportPlan {
+            transfer_id: "00".repeat(16),
+            filename: "source.bin".to_owned(),
+            size: 9,
+            chunk_size: 4,
+            num_chunks: 3,
+        };
+        let first = ExportChunkResult {
+            bytes: 4,
+            eof: false,
+        };
+        let final_chunk = ExportChunkResult {
+            bytes: 1,
+            eof: true,
+        };
+        let valid_first = sentinel0_proto::encode_binary_frame(transfer_id, 0, b"abcd");
+        let valid_last = sentinel0_proto::encode_binary_frame(transfer_id, 2, b"i");
+        assert_eq!(
+            validate_export_chunk_binary(&valid_first, &plan, 0, &first),
+            Ok(())
+        );
+        assert_eq!(
+            validate_export_chunk_binary(&valid_last, &plan, 2, &final_chunk),
+            Ok(())
+        );
+
+        // The response and binary agree with each other, but not with the
+        // planned size. A pairwise-only check would incorrectly accept it.
+        let wrong_size = sentinel0_proto::encode_binary_frame(transfer_id, 0, b"abc");
+        assert!(matches!(
+            validate_export_chunk_binary(
+                &wrong_size,
+                &plan,
+                0,
+                &ExportChunkResult {
+                    bytes: 3,
+                    eof: false
+                },
+            ),
+            Err(TransferProtocolError::InvalidChunk(_))
+        ));
+        let wrong_final_size = sentinel0_proto::encode_binary_frame(transfer_id, 2, b"ij");
+        assert!(matches!(
+            validate_export_chunk_binary(
+                &wrong_final_size,
+                &plan,
+                2,
+                &ExportChunkResult {
+                    bytes: 2,
+                    eof: true
+                },
+            ),
+            Err(TransferProtocolError::InvalidChunk(_))
+        ));
+        let wrong_id = sentinel0_proto::encode_binary_frame([1_u8; 16], 0, b"abcd");
+        assert!(matches!(
+            validate_export_chunk_binary(&wrong_id, &plan, 0, &first),
+            Err(TransferProtocolError::InvalidChunk(_))
+        ));
+        let wrong_index = sentinel0_proto::encode_binary_frame(transfer_id, 1, b"abcd");
+        assert!(matches!(
+            validate_export_chunk_binary(&wrong_index, &plan, 0, &first),
+            Err(TransferProtocolError::InvalidChunk(_))
+        ));
+        assert!(matches!(
+            validate_export_chunk_binary(&valid_first, &plan, 3, &first),
+            Err(TransferProtocolError::InvalidChunk(_))
+        ));
+        assert!(matches!(
+            validate_export_chunk_binary(
+                &valid_first,
+                &plan,
+                0,
+                &ExportChunkResult {
+                    bytes: 4,
+                    eof: true,
+                }
+            ),
+            Err(TransferProtocolError::InvalidChunk(_))
+        ));
+        assert!(matches!(
+            validate_export_chunk_binary(b"short", &plan, 0, &first),
+            Err(TransferProtocolError::InvalidChunk(_))
+        ));
+
+        // Empty files still use one zero-byte EOF chunk in this protocol.
+        let empty = ExportPlan {
+            size: 0,
+            num_chunks: 1,
+            ..plan
+        };
+        let empty_frame = sentinel0_proto::encode_binary_frame(transfer_id, 0, b"");
+        assert_eq!(
+            validate_export_chunk_binary(
+                &empty_frame,
+                &empty,
+                0,
+                &ExportChunkResult {
+                    bytes: 0,
+                    eof: true
+                },
+            ),
+            Ok(())
+        );
     }
 
     #[test]
