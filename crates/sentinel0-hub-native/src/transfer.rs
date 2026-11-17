@@ -6,15 +6,16 @@ use axum::{
 };
 use sentinel0_hub_core::{
     ExportChunkResult, ExportPlan, HostRegistry, HostResolutionError, TransferAckError,
-    TransferChunkAck, TransferProtocolError, export_complete_payload, parse_export_chunk_result,
+    TransferChunkAck, TransferProtocolError, export_chunk_payload, export_complete_payload,
+    export_init_payload, export_session_payload, hex_transfer_id, parse_export_chunk_result,
     parse_export_digest, parse_export_plan, parse_transfer_chunk_ack, parse_upload_result,
     transfer_success_result, upload_complete_payload, upload_init_payload,
     validate_destination_chunk_ack, validate_export_chunk_binary, validate_upload_init,
 };
-use sentinel0_proto::{Message, Op, TRANSFER_CHUNK_BYTES, decode_binary_frame};
+use sentinel0_proto::{Message, Op, decode_binary_frame};
 use serde::Deserialize;
 use serde_json::Value;
-use std::{collections::BTreeMap, fmt::Write as _, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 use tokio::sync::oneshot;
 use tracing::warn;
 use uuid::Uuid;
@@ -144,17 +145,7 @@ async fn transfer_file(
         state,
         &source,
         Op::FileExportInit,
-        BTreeMap::from([
-            ("transfer_id".to_owned(), Value::String(transfer_id.clone())),
-            (
-                "source_path".to_owned(),
-                Value::String(request.source_path.clone()),
-            ),
-            (
-                "chunk_size".to_owned(),
-                Value::from(u64::try_from(TRANSFER_CHUNK_BYTES).unwrap_or(u64::MAX)),
-            ),
-        ]),
+        export_init_payload(&transfer_id, &request.source_path),
         request.opaque_ref.as_deref(),
     )
     .await?;
@@ -343,13 +334,7 @@ async fn receive_source_chunk(
         state,
         source,
         Op::FileExportChunk,
-        BTreeMap::from([
-            (
-                "transfer_id".to_owned(),
-                Value::String(plan.transfer_id.clone()),
-            ),
-            ("chunk_index".to_owned(), Value::from(u64::from(index))),
-        ]),
+        export_chunk_payload(&plan.transfer_id, index),
         opaque_ref,
     )
     .await;
@@ -525,10 +510,7 @@ async fn best_effort_export_cleanup(
         state,
         source,
         Op::FileExportComplete,
-        BTreeMap::from([(
-            "transfer_id".to_owned(),
-            Value::String(transfer_id.to_owned()),
-        )]),
+        export_session_payload(transfer_id),
         opaque_ref,
     )
     .await
@@ -571,12 +553,4 @@ pub async fn handle_transfer_event(state: &AppState, host_id: &str, message: &Me
     } else {
         warn!(%host_id, transfer_id = %ack.transfer_id, chunk_index = ack.chunk_index, "unexpected transfer_chunk_ack event");
     }
-}
-
-fn hex_transfer_id(bytes: &[u8; 16]) -> String {
-    let mut out = String::with_capacity(32);
-    for byte in bytes {
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
 }
