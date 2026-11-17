@@ -45,11 +45,11 @@ pub use tooling::{
 };
 pub use transfer::{
     ExportChunkResult, ExportDigest, ExportPlan, HUB_TRANSFER_MAX_BYTES, TRANSFER_CHUNK_ACK_EVENT,
-    TransferAckError, TransferChunkAck, TransferProtocolError, UploadResult,
-    export_complete_payload, parse_export_chunk_result, parse_export_digest, parse_export_plan,
-    parse_transfer_chunk_ack, parse_upload_result, transfer_success_result,
-    upload_complete_payload, upload_init_payload, validate_destination_chunk_ack,
-    validate_export_chunk_binary, validate_upload_init,
+    TransferAckError, TransferChunkAck, TransferProtocolError, UploadResult, export_chunk_payload,
+    export_complete_payload, export_init_payload, export_session_payload, hex_transfer_id,
+    parse_export_chunk_result, parse_export_digest, parse_export_plan, parse_transfer_chunk_ack,
+    parse_upload_result, transfer_success_result, upload_complete_payload, upload_init_payload,
+    validate_destination_chunk_ack, validate_export_chunk_binary, validate_upload_init,
 };
 
 /// One enrolled host as understood by the Hub control plane.

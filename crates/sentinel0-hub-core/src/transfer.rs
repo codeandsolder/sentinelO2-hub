@@ -2,7 +2,7 @@
 
 use sentinel0_proto::{Message, ResponseError, TRANSFER_CHUNK_BYTES, decode_binary_frame};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt::Write as _};
 use thiserror::Error;
 
 pub const HUB_TRANSFER_MAX_BYTES: u64 = 512 * 1024 * 1024;
@@ -71,6 +71,57 @@ pub enum TransferProtocolError {
     InvalidChunk(String),
 }
 
+/// The source-export operations share a single wire protocol across Hub
+/// adapters; only their transports and ID generation differ.
+#[must_use]
+pub fn export_init_payload(transfer_id: &str, source_path: &str) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        (
+            "transfer_id".to_owned(),
+            Value::String(transfer_id.to_owned()),
+        ),
+        (
+            "source_path".to_owned(),
+            Value::String(source_path.to_owned()),
+        ),
+        (
+            "chunk_size".to_owned(),
+            Value::from(u64::try_from(TRANSFER_CHUNK_BYTES).unwrap_or(u64::MAX)),
+        ),
+    ])
+}
+
+#[must_use]
+pub fn export_chunk_payload(transfer_id: &str, chunk_index: u32) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        (
+            "transfer_id".to_owned(),
+            Value::String(transfer_id.to_owned()),
+        ),
+        (
+            "chunk_index".to_owned(),
+            Value::from(u64::from(chunk_index)),
+        ),
+    ])
+}
+
+#[must_use]
+pub fn export_session_payload(transfer_id: &str) -> BTreeMap<String, Value> {
+    BTreeMap::from([(
+        "transfer_id".to_owned(),
+        Value::String(transfer_id.to_owned()),
+    )])
+}
+
+#[must_use]
+pub fn hex_transfer_id(bytes: &[u8; 16]) -> String {
+    let mut out = String::with_capacity(32);
+    for byte in bytes {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
 /// Runtime-neutral payload sent to the destination before streaming begins.
 #[must_use]
 pub fn upload_init_payload(
@@ -97,10 +148,7 @@ pub fn upload_init_payload(
 
 #[must_use]
 pub fn export_complete_payload(plan: &ExportPlan) -> BTreeMap<String, Value> {
-    BTreeMap::from([(
-        "transfer_id".to_owned(),
-        Value::String(plan.transfer_id.clone()),
-    )])
+    export_session_payload(&plan.transfer_id)
 }
 
 #[must_use]
@@ -526,6 +574,33 @@ mod tests {
             sha256: "abcdef".to_owned(),
             target_path: "/dst".to_owned(),
         };
+        assert_eq!(
+            export_init_payload("feed", "/src"),
+            BTreeMap::from([
+                ("transfer_id".to_owned(), json!("feed")),
+                ("source_path".to_owned(), json!("/src")),
+                ("chunk_size".to_owned(), json!(TRANSFER_CHUNK_BYTES)),
+            ])
+        );
+        assert_eq!(
+            export_chunk_payload("feed", 2),
+            BTreeMap::from([
+                ("transfer_id".to_owned(), json!("feed")),
+                ("chunk_index".to_owned(), json!(2)),
+            ])
+        );
+        assert_eq!(
+            export_session_payload("feed"),
+            BTreeMap::from([("transfer_id".to_owned(), json!("feed"))])
+        );
+        assert_eq!(
+            hex_transfer_id(&[0_u8; 16]),
+            "00000000000000000000000000000000"
+        );
+        assert_eq!(
+            hex_transfer_id(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 254, 255]),
+            "000102030405060708090a0b0c0dfeff"
+        );
         let init = upload_init_payload(&plan, "/dst", true, false);
         assert_eq!(init.len(), 6);
         assert_eq!(init["upload_id"], "feed");
