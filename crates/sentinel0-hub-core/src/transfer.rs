@@ -1,7 +1,7 @@
 //! Runtime-independent file-transfer protocol validation.
 
 use sentinel0_proto::{Message, ResponseError, TRANSFER_CHUNK_BYTES, decode_binary_frame};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -69,6 +69,112 @@ pub enum TransferProtocolError {
     InvalidPlan(String),
     #[error("invalid source transfer chunk: {0}")]
     InvalidChunk(String),
+}
+
+/// Runtime-neutral payload sent to the destination before streaming begins.
+#[must_use]
+pub fn upload_init_payload(
+    plan: &ExportPlan,
+    destination_path: &str,
+    overwrite: bool,
+    land_in_place: bool,
+) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        (
+            "upload_id".to_owned(),
+            Value::String(plan.transfer_id.clone()),
+        ),
+        (
+            "target_path".to_owned(),
+            Value::String(destination_path.to_owned()),
+        ),
+        ("total_size".to_owned(), Value::from(plan.size)),
+        ("overwrite".to_owned(), Value::Bool(overwrite)),
+        ("land_in_place".to_owned(), Value::Bool(land_in_place)),
+        ("filename".to_owned(), Value::String(plan.filename.clone())),
+    ])
+}
+
+#[must_use]
+pub fn export_complete_payload(plan: &ExportPlan) -> BTreeMap<String, Value> {
+    BTreeMap::from([(
+        "transfer_id".to_owned(),
+        Value::String(plan.transfer_id.clone()),
+    )])
+}
+
+#[must_use]
+pub fn upload_complete_payload(
+    plan: &ExportPlan,
+    digest: &ExportDigest,
+) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        (
+            "upload_id".to_owned(),
+            Value::String(plan.transfer_id.clone()),
+        ),
+        ("sha256".to_owned(), Value::String(digest.sha256.clone())),
+    ])
+}
+
+#[must_use]
+pub fn transfer_success_result(
+    plan: &ExportPlan,
+    source_host_id: &str,
+    destination_host_id: &str,
+    source_path: &str,
+    upload: &UploadResult,
+) -> Value {
+    json!({
+        "ok": true,
+        "transfer_id": plan.transfer_id,
+        "source_host_id": source_host_id,
+        "destination_host_id": destination_host_id,
+        "source_path": source_path,
+        "destination_path": upload.target_path,
+        "size": upload.size,
+        "sha256": upload.sha256,
+        "chunks": plan.num_chunks,
+    })
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum TransferAckError {
+    #[error("{0}")]
+    Rejected(String),
+    #[error("destination acknowledged {actual:?} bytes for chunk {index}, expected {expected}")]
+    IncorrectBytes {
+        index: u32,
+        actual: Option<u64>,
+        expected: u64,
+    },
+}
+
+/// Check a destination acknowledgement without coupling protocol validation to
+/// the native or Worker HTTP error type.
+///
+/// # Errors
+/// Returns the exact rejection or byte-count mismatch.
+pub fn validate_destination_chunk_ack(
+    ack: &TransferChunkAck,
+    index: u32,
+    expected_bytes: u64,
+) -> Result<(), TransferAckError> {
+    if !ack.ok {
+        return Err(TransferAckError::Rejected(
+            ack.error
+                .clone()
+                .unwrap_or_else(|| "destination rejected chunk".to_owned()),
+        ));
+    }
+    if ack.bytes != Some(expected_bytes) {
+        return Err(TransferAckError::IncorrectBytes {
+            index,
+            actual: ack.bytes,
+            expected: expected_bytes,
+        });
+    }
+    Ok(())
 }
 
 fn successful_result(message: &Message) -> Result<&BTreeMap<String, Value>, TransferProtocolError> {
@@ -398,6 +504,87 @@ mod tests {
             result: Some(result),
             error: None,
         }
+    }
+
+    #[test]
+    fn shared_transfer_requests_and_result_keep_wire_contract() {
+        let plan = ExportPlan {
+            transfer_id: "feed".to_owned(),
+            filename: "source.bin".to_owned(),
+            size: 9,
+            chunk_size: 4,
+            num_chunks: 3,
+        };
+        let digest = ExportDigest {
+            size: 9,
+            chunks_read: 3,
+            num_chunks: 3,
+            sha256: "abcdef".to_owned(),
+        };
+        let upload = UploadResult {
+            size: 9,
+            sha256: "abcdef".to_owned(),
+            target_path: "/dst".to_owned(),
+        };
+        let init = upload_init_payload(&plan, "/dst", true, false);
+        assert_eq!(init.len(), 6);
+        assert_eq!(init["upload_id"], "feed");
+        assert_eq!(init["target_path"], "/dst");
+        assert_eq!(init["overwrite"], true);
+        assert_eq!(init["land_in_place"], false);
+        assert_eq!(init["total_size"], 9);
+        assert_eq!(init["filename"], "source.bin");
+        assert_eq!(
+            export_complete_payload(&plan),
+            BTreeMap::from([("transfer_id".to_owned(), json!("feed"))])
+        );
+        assert_eq!(
+            upload_complete_payload(&plan, &digest),
+            BTreeMap::from([
+                ("upload_id".to_owned(), json!("feed")),
+                ("sha256".to_owned(), json!("abcdef")),
+            ])
+        );
+        assert_eq!(
+            transfer_success_result(&plan, "source", "destination", "/src", &upload),
+            json!({
+                "ok": true,
+                "transfer_id": "feed",
+                "source_host_id": "source",
+                "destination_host_id": "destination",
+                "source_path": "/src",
+                "destination_path": "/dst",
+                "size": 9,
+                "sha256": "abcdef",
+                "chunks": 3,
+            })
+        );
+    }
+
+    #[test]
+    fn chunk_ack_rejection_and_size_mismatch_have_distinct_errors() {
+        let mut ack = TransferChunkAck {
+            transfer_id: "feed".to_owned(),
+            chunk_index: 4,
+            ok: true,
+            bytes: Some(7),
+            error: None,
+        };
+        assert_eq!(validate_destination_chunk_ack(&ack, 4, 7), Ok(()));
+        assert_eq!(
+            validate_destination_chunk_ack(&ack, 4, 8),
+            Err(TransferAckError::IncorrectBytes {
+                index: 4,
+                actual: Some(7),
+                expected: 8
+            })
+        );
+        ack.ok = false;
+        ack.error = Some("invalid frame".to_owned());
+        assert_eq!(
+            validate_destination_chunk_ack(&ack, 4, 7),
+            Err(TransferAckError::Rejected("invalid frame".to_owned()))
+        );
     }
 
     #[test]

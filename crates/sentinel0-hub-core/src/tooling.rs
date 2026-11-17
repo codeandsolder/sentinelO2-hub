@@ -1,6 +1,7 @@
 use crate::DirectTool;
+use crate::schema::object_schema;
 use sentinel0_proto::Op;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 fn nullable_string() -> Value {
     json!({"type": ["string", "null"]})
@@ -12,22 +13,6 @@ fn opaque_ref_schema() -> Value {
 
 fn host_schema() -> Value {
     nullable_string()
-}
-
-fn object_schema(
-    required: &[&str],
-    properties: impl IntoIterator<Item = (&'static str, Value)>,
-) -> Value {
-    let mut props = Map::new();
-    for (name, schema) in properties {
-        props.insert(name.to_owned(), schema);
-    }
-    json!({
-        "type": "object",
-        "properties": props,
-        "required": required,
-        "additionalProperties": false
-    })
 }
 
 fn with_host_and_ref(mut fields: Vec<(&'static str, Value)>) -> Vec<(&'static str, Value)> {
