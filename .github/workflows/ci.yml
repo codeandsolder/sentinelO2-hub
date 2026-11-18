@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# New commits to a PR supersede stale checks, but not main pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   rust:
     runs-on: ubuntu-latest
