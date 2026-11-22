@@ -62,7 +62,7 @@ pub struct NativeStore {
 }
 
 impl NativeStore {
-    pub fn open(path: &str) -> Result<Self, StoreError> {
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, StoreError> {
         let connection = Connection::open(path)?;
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -579,9 +579,7 @@ mod tests {
             uuid::Uuid::now_v7().simple()
         ));
         {
-            let store = NativeStore::open(path.to_str().ok_or_else(|| {
-                StoreError::CorruptIdempotency("temporary path is not UTF-8".to_owned())
-            })?)?;
+            let store = NativeStore::open(&path)?;
             store.persist_hello("host_a", "alpha", "1.0", "1.13")?;
             store.persist_hello("host_b", "beta", "1.0", "1.13")?;
             store.set_host_label("host_a", Some("build"))?;
@@ -589,9 +587,7 @@ mod tests {
             store.set_default_host("host_a")?;
         }
         {
-            let store = NativeStore::open(path.to_str().ok_or_else(|| {
-                StoreError::CorruptIdempotency("temporary path is not UTF-8".to_owned())
-            })?)?;
+            let store = NativeStore::open(&path)?;
             let registry = store.load_host_registry()?;
             assert_eq!(registry.default_host_id(), Some("host_a"));
             let hosts = registry.hosts().collect::<Vec<_>>();

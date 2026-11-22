@@ -13,3 +13,7 @@ The implementation is split into a portable state/compatibility core and deploym
 The native adapter accepts a current Sentinel0² agent on `/agent/connect`, performs the v1 hello/welcome handshake, maintains host routing state, and forwards `POST /v1/op` requests over the agent WebSocket.
 
 This is deliberately not yet production authentication/storage. It is the smallest end-to-end slice needed to run the real agent against the open Hub and turn hosted-SentinelX behavior into differential tests.
+
+## Native deployment configuration
+
+The native binary takes `--listen <IP:PORT>` (default `127.0.0.1:8788`) and `--database <PATH>` (default `sentinel0-hub.sqlite3`). Use an explicit absolute database path in service deployments. Enrollment and API tokens remain secret environment inputs; `RUST_LOG` controls tracing.
