@@ -16,6 +16,7 @@ use axum::{
     routing::{get, post, put},
 };
 use chrono::Utc;
+use clap::Parser;
 use futures_util::{SinkExt as _, StreamExt as _};
 use sentinel0_hub_core::{
     DIRECT_TOOLS, DirectRequestError, DirectRequestInput, HostRegistry, HostResolutionError,
@@ -29,6 +30,8 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     env,
+    net::SocketAddr,
+    path::PathBuf,
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
@@ -111,8 +114,19 @@ struct ErrorBody {
     message: String,
 }
 
+#[derive(Debug, Parser)]
+struct Args {
+    /// Address on which the native hub listens.
+    #[arg(long, default_value = "127.0.0.1:8788")]
+    listen: SocketAddr,
+    /// SQLite database path.
+    #[arg(long, default_value = "sentinel0-hub.sqlite3")]
+    database: PathBuf,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -122,10 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let enrollment_token = env::var("SENTINEL0_ENROLLMENT_TOKEN")?;
     let api_token = env::var("SENTINEL0_API_TOKEN")?;
-    let listen = env::var("SENTINEL0_LISTEN").unwrap_or_else(|_| "127.0.0.1:8788".to_owned());
-    let database_path =
-        env::var("SENTINEL0_DB_PATH").unwrap_or_else(|_| "sentinel0-hub.sqlite3".to_owned());
-    let store = NativeStore::open(&database_path)?;
+    let store = NativeStore::open(&args.database)?;
     let registry = store.load_host_registry()?;
 
     let state = AppState {
@@ -178,8 +189,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(mcp)
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(&listen).await?;
-    info!(%listen, "Sentinel0² native Hub listening");
+    let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    info!(listen = %listener.local_addr()?, "Sentinel0² native Hub listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -1180,3 +1191,26 @@ fn api_error(status: StatusCode, code: &'static str, message: String) -> Respons
 
 #[cfg(test)]
 mod integration_tests;
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn native_deployment_options_are_explicit() -> Result<(), Box<dyn std::error::Error>> {
+        let defaults = Args::try_parse_from(["hub"])?;
+        assert_eq!(defaults.listen, "127.0.0.1:8788".parse::<SocketAddr>()?);
+        assert_eq!(defaults.database, PathBuf::from("sentinel0-hub.sqlite3"));
+        let explicit = Args::try_parse_from([
+            "hub",
+            "--listen",
+            "[::1]:9000",
+            "--database",
+            "/tmp/hub.sqlite3",
+        ])?;
+        assert_eq!(explicit.listen, "[::1]:9000".parse::<SocketAddr>()?);
+        assert_eq!(explicit.database, PathBuf::from("/tmp/hub.sqlite3"));
+        assert!(Args::try_parse_from(["hub", "--listen", "invalid"]).is_err());
+        Ok(())
+    }
+}

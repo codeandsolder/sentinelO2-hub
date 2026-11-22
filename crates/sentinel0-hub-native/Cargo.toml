@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 axum.workspace = true
 chrono.workspace = true
+clap.workspace = true
 futures-util.workspace = true
 http.workspace = true
 rusqlite.workspace = true
