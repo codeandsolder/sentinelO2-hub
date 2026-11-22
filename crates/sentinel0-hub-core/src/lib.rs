@@ -63,7 +63,7 @@ pub struct HostRecord {
 }
 
 impl HostRecord {
-    #[must_use]
+    #[must_use = "the result determines whether this host can receive requests"]
     pub const fn eligible(&self) -> bool {
         self.connected && !self.disabled
     }
@@ -92,7 +92,7 @@ pub enum HostResolutionError {
 }
 
 impl HostRegistry {
-    #[must_use]
+    #[must_use = "the returned directory contains the indexed host records and default selection"]
     pub fn from_records(
         hosts: impl IntoIterator<Item = HostRecord>,
         default_host_id: Option<String>,
@@ -106,7 +106,7 @@ impl HostRegistry {
         }
     }
 
-    #[must_use]
+    #[must_use = "the result identifies the configured default host, if any"]
     pub fn default_host_id(&self) -> Option<&str> {
         self.default_host_id.as_deref()
     }
@@ -366,22 +366,22 @@ pub const DIRECT_TOOLS: [DirectTool; 25] = [
     },
 ];
 
-#[must_use]
+#[must_use = "the result identifies the direct tool for the requested operation"]
 pub fn direct_tool_by_op(name: &str) -> Option<&'static DirectTool> {
     DIRECT_TOOLS.iter().find(|tool| tool.op.as_str() == name)
 }
 
-#[must_use]
+#[must_use = "the result identifies the direct tool for the requested public name"]
 pub fn direct_tool_by_public_name(name: &str) -> Option<&'static DirectTool> {
     DIRECT_TOOLS.iter().find(|tool| tool.public_name == name)
 }
 
-#[must_use]
+#[must_use = "the result determines whether the requested operation is recognized"]
 pub fn parse_direct_op(name: &str) -> Option<Op> {
     direct_tool_by_op(name).map(|tool| tool.op)
 }
 
-#[must_use]
+#[must_use = "the returned document describes the direct REST API"]
 pub fn direct_rest_openapi() -> Value {
     let op_names = DIRECT_TOOLS
         .iter()
@@ -468,7 +468,7 @@ pub fn direct_rest_openapi() -> Value {
 }
 
 /// Canonical request fingerprint used by REST/MCP idempotency.
-#[must_use]
+#[must_use = "the fingerprint identifies the invocation for deduplication"]
 pub fn invocation_fingerprint(op: Op, host_id: &str, payload: &Value) -> String {
     let mut root = Map::new();
     root.insert("host_id".to_owned(), Value::String(host_id.to_owned()));

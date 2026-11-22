@@ -117,12 +117,12 @@ pub const HUB_TOOLS: [HubTool; 20] = [
     },
 ];
 
-#[must_use]
+#[must_use = "the result identifies the requested hub tool or reports an unknown name"]
 pub fn hub_tool_by_public_name(name: &str) -> Option<&'static HubTool> {
     HUB_TOOLS.iter().find(|tool| tool.public_name == name)
 }
 
-#[must_use]
+#[must_use = "the returned text documents the selected hub operation"]
 pub const fn hub_tool_description(kind: HubToolKind) -> &'static str {
     match kind {
         HubToolKind::ListHosts => {
@@ -264,7 +264,7 @@ fn service_schema() -> Value {
     )
 }
 
-#[must_use]
+#[must_use = "the schema describes the accepted arguments for this tool"]
 pub fn hub_tool_input_schema(kind: HubToolKind) -> Value {
     match kind {
         HubToolKind::ListHosts
@@ -383,7 +383,7 @@ pub fn hub_protocol_call(
     }))
 }
 
-#[must_use]
+#[must_use = "the returned object is the tool's MCP catalog entry"]
 pub fn hub_tool_mcp_entry(tool: &HubTool) -> Value {
     json!({
         "name": tool.public_name,
@@ -393,12 +393,12 @@ pub fn hub_tool_mcp_entry(tool: &HubTool) -> Value {
     })
 }
 
-#[must_use]
+#[must_use = "the returned list contains the available hub tool descriptors"]
 pub fn hub_tool_catalog() -> Vec<Value> {
     HUB_TOOLS.iter().map(hub_tool_mcp_entry).collect()
 }
 
-#[must_use]
+#[must_use = "the returned catalog describes all model-visible tools"]
 pub fn model_tool_catalog() -> Vec<Value> {
     let mut tools = direct_tool_catalog(&DIRECT_TOOLS);
     tools.extend(hub_tool_catalog());

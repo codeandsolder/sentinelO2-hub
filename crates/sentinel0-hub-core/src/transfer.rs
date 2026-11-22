@@ -73,7 +73,7 @@ pub enum TransferProtocolError {
 
 /// The source-export operations share a single wire protocol across Hub
 /// adapters; only their transports and ID generation differ.
-#[must_use]
+#[must_use = "the returned payload initiates the export session"]
 pub fn export_init_payload(transfer_id: &str, source_path: &str) -> BTreeMap<String, Value> {
     BTreeMap::from([
         (
@@ -91,7 +91,7 @@ pub fn export_init_payload(transfer_id: &str, source_path: &str) -> BTreeMap<Str
     ])
 }
 
-#[must_use]
+#[must_use = "the returned payload requests the indicated export chunk"]
 pub fn export_chunk_payload(transfer_id: &str, chunk_index: u32) -> BTreeMap<String, Value> {
     BTreeMap::from([
         (
@@ -105,7 +105,7 @@ pub fn export_chunk_payload(transfer_id: &str, chunk_index: u32) -> BTreeMap<Str
     ])
 }
 
-#[must_use]
+#[must_use = "the returned payload identifies the export session"]
 pub fn export_session_payload(transfer_id: &str) -> BTreeMap<String, Value> {
     BTreeMap::from([(
         "transfer_id".to_owned(),
@@ -113,7 +113,7 @@ pub fn export_session_payload(transfer_id: &str) -> BTreeMap<String, Value> {
     )])
 }
 
-#[must_use]
+#[must_use = "the returned string encodes the transfer identifier for the protocol"]
 pub fn hex_transfer_id(bytes: &[u8; 16]) -> String {
     let mut out = String::with_capacity(32);
     for byte in bytes {
@@ -123,7 +123,7 @@ pub fn hex_transfer_id(bytes: &[u8; 16]) -> String {
 }
 
 /// Runtime-neutral payload sent to the destination before streaming begins.
-#[must_use]
+#[must_use = "the returned payload initializes the upload session"]
 pub fn upload_init_payload(
     plan: &ExportPlan,
     destination_path: &str,
@@ -146,12 +146,12 @@ pub fn upload_init_payload(
     ])
 }
 
-#[must_use]
+#[must_use = "the returned payload communicates export completion"]
 pub fn export_complete_payload(plan: &ExportPlan) -> BTreeMap<String, Value> {
     export_session_payload(&plan.transfer_id)
 }
 
-#[must_use]
+#[must_use = "the returned payload communicates upload completion"]
 pub fn upload_complete_payload(
     plan: &ExportPlan,
     digest: &ExportDigest,
@@ -165,7 +165,7 @@ pub fn upload_complete_payload(
     ])
 }
 
-#[must_use]
+#[must_use = "the returned object describes the successful transfer to the caller"]
 pub fn transfer_success_result(
     plan: &ExportPlan,
     source_host_id: &str,

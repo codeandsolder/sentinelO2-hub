@@ -21,7 +21,7 @@ fn with_host_and_ref(mut fields: Vec<(&'static str, Value)>) -> Vec<(&'static st
     fields
 }
 
-#[must_use]
+#[must_use = "the returned text documents the direct operation"]
 pub const fn direct_tool_description(op: Op) -> &'static str {
     match op {
         Op::Ping => "Simple SentinelX health check.",
@@ -53,7 +53,7 @@ pub const fn direct_tool_description(op: Op) -> &'static str {
     }
 }
 
-#[must_use]
+#[must_use = "the returned schema defines the accepted operation arguments"]
 pub fn direct_tool_input_schema(op: Op) -> Value {
     match op {
         Op::Ping | Op::Capabilities | Op::Help | Op::State | Op::EditUploadInit => {
@@ -362,7 +362,7 @@ fn edit_fields(upload_complete: bool) -> Vec<(&'static str, Value)> {
     fields
 }
 
-#[must_use]
+#[must_use = "the returned object describes this direct tool to MCP clients"]
 pub fn direct_tool_mcp_entry(tool: &DirectTool) -> Value {
     json!({
         "name": tool.public_name,
@@ -372,7 +372,7 @@ pub fn direct_tool_mcp_entry(tool: &DirectTool) -> Value {
     })
 }
 
-#[must_use]
+#[must_use = "the returned list contains MCP entries for the supplied direct tools"]
 pub fn direct_tool_catalog(tools: &[DirectTool]) -> Vec<Value> {
     tools.iter().map(direct_tool_mcp_entry).collect()
 }
