@@ -33,7 +33,7 @@ pub struct PreparedDirectRequest {
 }
 
 impl PreparedDirectRequest {
-    #[must_use]
+    #[must_use = "the result determines whether the request should run in the background"]
     pub fn background_requested(&self) -> bool {
         self.payload
             .get("background")
@@ -46,7 +46,7 @@ impl PreparedDirectRequest {
             .insert("job_id".to_owned(), Value::String(job_id.to_owned()));
     }
 
-    #[must_use]
+    #[must_use = "the returned message carries the request across the transport"]
     pub fn wire_message(&self, request_id: String) -> Message {
         Message::Request {
             id: request_id,
@@ -159,13 +159,13 @@ pub struct DirectResponse {
 }
 
 impl DirectResponse {
-    #[must_use]
+    #[must_use = "the returned response carries the replay marker"]
     pub const fn replayed(mut self) -> Self {
         self.replayed = true;
         self
     }
 
-    #[must_use]
+    #[must_use = "the result identifies the running job when one was returned"]
     pub fn running_job_id(&self) -> Option<&str> {
         let result = self.result.as_ref()?;
         (self.ok && result.get("status").and_then(Value::as_str) == Some("running"))

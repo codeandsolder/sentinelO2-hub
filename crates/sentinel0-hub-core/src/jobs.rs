@@ -18,7 +18,7 @@ pub struct JobCompletion {
 }
 
 impl JobCompletion {
-    #[must_use]
+    #[must_use = "the returned summary is the job information presented to the caller"]
     pub fn summary(&self) -> Value {
         let mut summary = Map::new();
         for key in [

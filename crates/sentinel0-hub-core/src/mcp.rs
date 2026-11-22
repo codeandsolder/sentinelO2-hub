@@ -72,7 +72,7 @@ pub enum McpRequestError {
 }
 
 impl McpRequestError {
-    #[must_use]
+    #[must_use = "the returned code determines the JSON-RPC error classification"]
     pub const fn jsonrpc_code(&self) -> i64 {
         match self {
             Self::MethodHeaderMismatch | Self::NameHeaderMismatch => MCP_HEADER_MISMATCH,
@@ -89,7 +89,7 @@ impl McpRequestError {
     }
 }
 
-#[must_use]
+#[must_use = "the returned object describes the MCP server identity"]
 pub fn mcp_server_info() -> Value {
     json!({
         "name": "sentinel0-hub",
@@ -97,14 +97,14 @@ pub fn mcp_server_info() -> Value {
     })
 }
 
-#[must_use]
+#[must_use = "the returned metadata accompanies the MCP response"]
 pub fn mcp_response_meta() -> Value {
     json!({
         "io.modelcontextprotocol/serverInfo": mcp_server_info()
     })
 }
 
-#[must_use]
+#[must_use = "the returned JSON object is the successful JSON-RPC response"]
 pub fn mcp_jsonrpc_result(id: &Value, mut result: Value) -> Value {
     if let Value::Object(values) = &mut result {
         values
@@ -117,7 +117,7 @@ pub fn mcp_jsonrpc_result(id: &Value, mut result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
-#[must_use]
+#[must_use = "the returned JSON object is the JSON-RPC error response"]
 pub fn mcp_jsonrpc_error(id: &Value, code: i64, message: impl Into<String>) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -126,7 +126,7 @@ pub fn mcp_jsonrpc_error(id: &Value, code: i64, message: impl Into<String>) -> V
     })
 }
 
-#[must_use]
+#[must_use = "the returned object answers the MCP discovery request"]
 pub fn mcp_discover_response(id: &Value) -> Value {
     mcp_jsonrpc_result(
         id,
@@ -140,7 +140,7 @@ pub fn mcp_discover_response(id: &Value) -> Value {
     )
 }
 
-#[must_use]
+#[must_use = "the returned response communicates the tool catalog to the client"]
 pub fn mcp_tools_list_response(id: &Value) -> Value {
     mcp_jsonrpc_result(
         id,
@@ -252,7 +252,7 @@ pub fn parse_mcp_direct_call(request: &McpRequest) -> Result<McpDirectCall, McpR
     }
 }
 
-#[must_use]
+#[must_use = "the returned object contains the MCP success result"]
 pub fn mcp_tool_success(result: &Value) -> Value {
     let text = serde_json::to_string(result).unwrap_or_else(|_| "null".to_owned());
     json!({
@@ -262,7 +262,7 @@ pub fn mcp_tool_success(result: &Value) -> Value {
     })
 }
 
-#[must_use]
+#[must_use = "the returned object contains the MCP error result"]
 pub fn mcp_tool_error(message: impl Into<String>, structured: Option<Value>) -> Value {
     let message = message.into();
     let mut result = json!({
@@ -284,7 +284,7 @@ pub fn mcp_tool_error(message: impl Into<String>, structured: Option<Value>) -> 
 /// # Examples
 /// `direct_response_part(json!({"ok": true, "result": {"bytes": 4}}))`
 /// returns `{"ok": true, "bytes": 4}`.
-#[must_use]
+#[must_use = "the returned value is the converted direct response payload"]
 pub fn direct_response_part(value: Value) -> Value {
     let response = match serde_json::from_value::<DirectResponse>(value) {
         Ok(response) => response,
@@ -317,7 +317,7 @@ pub fn direct_response_part(value: Value) -> Value {
     }
 }
 
-#[must_use]
+#[must_use = "the returned MCP result preserves the direct response outcome"]
 pub fn mcp_tool_result_from_direct(response: &DirectResponse) -> Value {
     if response.ok {
         let result = response.result.as_ref().map_or_else(
