@@ -20,14 +20,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Resolve the native quarantined compiler
         id: compiler
-        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@25d6a3701f7da8aaaf21821db2c49ead32fbdcf2 # main
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@a5eb5179a21839ed047f10897a01ce3c7ec178b4 # main
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: ${{ steps.compiler.outputs.channel }}
           components: clippy,rustfmt
           targets: wasm32-unknown-unknown
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@25d6a3701f7da8aaaf21821db2c49ead32fbdcf2 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@a5eb5179a21839ed047f10897a01ce3c7ec178b4 # main
         with:
           rust-toolchain: ${{ steps.compiler.outputs.channel }}
       - name: Format
@@ -43,4 +43,4 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@25d6a3701f7da8aaaf21821db2c49ead32fbdcf2 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@a5eb5179a21839ed047f10897a01ce3c7ec178b4 # main
