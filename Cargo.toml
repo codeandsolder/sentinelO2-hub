@@ -32,7 +32,7 @@ tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "t
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 uuid = { version = "1.23.0", features = ["serde", "v7"] }
-sentinel0-proto = { git = "https://github.com/codeandsolder/sentinelO2-cloud-core.git", rev = "04272a07620c4dbc025ca42cf4c92e9ef0d54009", package = "sentinel0-proto" }
+sentinel0-proto = { git = "https://github.com/codeandsolder/sentinelO2-cloud-core.git", rev = "e60e0abebe92aaafb88952a2eece08867feb165a", package = "sentinel0-proto" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
