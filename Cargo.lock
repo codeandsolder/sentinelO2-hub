@@ -1060,7 +1060,7 @@ dependencies = [
 [[package]]
 name = "sentinel0-proto"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/sentinelO2-cloud-core.git?rev=d4bf6a2d78de359d9a5aa47e790cc54650796746#d4bf6a2d78de359d9a5aa47e790cc54650796746"
+source = "git+https://github.com/codeandsolder/sentinelO2-cloud-core.git?rev=04272a07620c4dbc025ca42cf4c92e9ef0d54009#04272a07620c4dbc025ca42cf4c92e9ef0d54009"
 dependencies = [
  "serde",
  "serde_json",
