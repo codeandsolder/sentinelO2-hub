@@ -15,7 +15,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/codeandsolder/sentinelO2-hub"
-rust-version = "1.99"
+rust-version = "1.100"
 
 [workspace.dependencies]
 axum = { version = "0.8.9", features = ["ws"] }
@@ -32,7 +32,7 @@ tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "t
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 uuid = { version = "1.23.0", features = ["serde", "v7"] }
-sentinel0-proto = { git = "https://github.com/codeandsolder/sentinelO2-cloud-core.git", rev = "1a0ce85eb2049371412ac0ea5103588c20158c96", package = "sentinel0-proto" }
+sentinel0-proto = { git = "https://github.com/codeandsolder/sentinelO2-cloud-core.git", rev = "d4bf6a2d78de359d9a5aa47e790cc54650796746", package = "sentinel0-proto" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -51,3 +51,6 @@ must_use_candidate = "warn"
 missing_errors_doc = "warn"
 missing_panics_doc = "warn"
 similar_names = "warn"
+
+[patch.crates-io]
+worker = { git = "https://github.com/codeandsolder/cargo-patches.git", rev = "013043a6823c66a0f4e4c72059750d1543a7d4e3" }
