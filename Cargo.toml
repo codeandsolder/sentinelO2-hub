@@ -18,7 +18,7 @@ repository = "https://github.com/codeandsolder/sentinelO2-hub"
 rust-version = "1.100"
 
 [workspace.dependencies]
-axum = { version = "0.8.9", features = ["ws"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "ws", "tracing", "tower-log"] }
 clap = { version = "4.6.7", features = ["derive"] }
 time = { version = "0.3.55", features = ["wasm-bindgen"] }
 futures-util = "0.3.34"
@@ -29,7 +29,7 @@ serde_json = "1.0.151"
 sha2 = "0.11.0"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal"] }
-tracing = "0.1.44"
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 uuid = { version = "1.23.0", features = ["serde", "v7"] }
 sentinel0-proto = { git = "https://github.com/codeandsolder/sentinelO2-cloud-core.git", rev = "e60e0abebe92aaafb88952a2eece08867feb165a", package = "sentinel0-proto" }
@@ -54,3 +54,5 @@ similar_names = "warn"
 
 [patch.crates-io]
 worker = { git = "https://github.com/codeandsolder/cargo-patches.git", rev = "013043a6823c66a0f4e4c72059750d1543a7d4e3" }
+
+axum = { git = "https://github.com/codeandsolder/cargo-patches.git", rev = "431662f5e38c95ac118f9895a0e8f48f3245de8e" }
