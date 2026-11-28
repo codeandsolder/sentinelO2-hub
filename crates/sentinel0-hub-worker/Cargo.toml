@@ -10,7 +10,7 @@ rust-version.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-chrono.workspace = true
+time.workspace = true
 futures-channel = "0.3.34"
 futures-util.workspace = true
 serde.workspace = true

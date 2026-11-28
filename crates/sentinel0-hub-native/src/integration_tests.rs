@@ -149,7 +149,7 @@ async fn responses_are_correlated_to_the_dispatched_host() -> TestResult {
     send_agent(&mut beta, &impostor).await?;
 
     // A round-trip Ping guarantees the preceding response was processed.
-    let timestamp = Utc::now();
+    let timestamp = UtcDateTime::now();
     send_agent(&mut beta, &Message::Ping { timestamp }).await?;
     assert!(matches!(read_agent(&mut beta).await?, Message::Pong { .. }));
     assert!(
@@ -245,7 +245,7 @@ async fn replaced_connection_cannot_disconnect_the_new_session() -> TestResult {
 
     let _ = old.close(None).await;
     // The current socket must remain live despite the superseded close.
-    let timestamp = Utc::now();
+    let timestamp = UtcDateTime::now();
     send_agent(&mut current, &Message::Ping { timestamp }).await?;
     assert!(matches!(
         read_agent(&mut current).await?,

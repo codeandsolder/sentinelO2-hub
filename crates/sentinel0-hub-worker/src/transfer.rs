@@ -128,7 +128,7 @@ impl TenantHub {
 
         let transfer_id = format!(
             "{:016x}{:016x}",
-            worker::Date::now().as_millis(),
+            super::now_millis(),
             self.next_transfer_nonce()
         );
         let source_init = self
