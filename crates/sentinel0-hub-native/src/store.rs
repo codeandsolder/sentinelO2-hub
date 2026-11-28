@@ -1,9 +1,9 @@
-use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension as _, params};
 use sentinel0_hub_core::{HostRecord, HostRegistry, JobCompletion};
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
+use time::UtcDateTime;
 
 const IDEMPOTENCY_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 
@@ -129,7 +129,7 @@ impl NativeStore {
                 [],
             )?;
         }
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = sentinel0_proto::clock::unix_millis(UtcDateTime::now());
         connection.execute(
             "UPDATE jobs SET status = 'orphaned', updated_ms = ?1 WHERE status = 'running'",
             params![now_ms],
@@ -198,7 +198,7 @@ impl NativeStore {
                 hostname,
                 agent_version,
                 protocol_version,
-                Utc::now().timestamp_millis()
+                sentinel0_proto::clock::unix_millis(UtcDateTime::now())
             ],
         )?;
         Ok(())
@@ -207,7 +207,10 @@ impl NativeStore {
     pub fn mark_host_disconnected(&self, host_id: &str) -> Result<(), StoreError> {
         self.connection.execute(
             "UPDATE hosts SET last_disconnected_ms = ?1 WHERE host_id = ?2",
-            params![Utc::now().timestamp_millis(), host_id],
+            params![
+                sentinel0_proto::clock::unix_millis(UtcDateTime::now()),
+                host_id
+            ],
         )?;
         Ok(())
     }
@@ -264,7 +267,7 @@ impl NativeStore {
         hub_request_id: &str,
         host_id: &str,
     ) -> Result<BeginIdempotency, StoreError> {
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = sentinel0_proto::clock::unix_millis(UtcDateTime::now());
         self.connection.execute(
             "DELETE FROM idempotency WHERE expires_ms <= ?1",
             params![now_ms],
@@ -380,7 +383,7 @@ impl NativeStore {
     }
 
     pub fn mark_running_jobs_orphaned(&self, host_id: &str) -> Result<usize, StoreError> {
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = sentinel0_proto::clock::unix_millis(UtcDateTime::now());
         Ok(self.connection.execute(
             "UPDATE jobs SET status = 'orphaned', updated_ms = ?1
              WHERE host_id = ?2 AND status = 'running'",
@@ -389,7 +392,7 @@ impl NativeStore {
     }
 
     pub fn job_started(&self, job_id: &str, host_id: &str, tool: &str) -> Result<(), StoreError> {
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = sentinel0_proto::clock::unix_millis(UtcDateTime::now());
         self.connection.execute(
             "INSERT INTO jobs
                 (job_id, host_id, tool, status, completion_json, created_ms, updated_ms)
@@ -416,7 +419,7 @@ impl NativeStore {
             return Err(StoreError::JobHostMismatch);
         }
 
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = sentinel0_proto::clock::unix_millis(UtcDateTime::now());
         let completion_json = serde_json::to_string(&completion.data)?;
         let summary_json = serde_json::to_string(&completion.summary())?;
         self.connection.execute(
@@ -468,7 +471,7 @@ impl NativeStore {
             .collect::<Result<Vec<_>, _>>()?;
         drop(unread_statement);
 
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = sentinel0_proto::clock::unix_millis(UtcDateTime::now());
         let mut completed = Vec::with_capacity(unread.len());
         for (notification_id, summary_json) in unread {
             completed.push(serde_json::from_str(&summary_json)?);
@@ -529,7 +532,7 @@ impl NativeStore {
     }
 
     pub fn notifications_ack(&self, job_id: Option<&str>) -> Result<usize, StoreError> {
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = sentinel0_proto::clock::unix_millis(UtcDateTime::now());
         let changed = match job_id {
             None | Some("all") => self.connection.execute(
                 "UPDATE notifications SET acked_ms = ?1 WHERE acked_ms IS NULL",

@@ -119,7 +119,7 @@ async fn acknowledge(
         &Message::Event {
             kind: "transfer_chunk_ack".to_owned(),
             data: serde_json::from_value(data)?,
-            timestamp: Utc::now(),
+            timestamp: UtcDateTime::now(),
         },
     )
     .await
@@ -266,7 +266,7 @@ async fn expect_export_cleanup(harness: &mut TransferHarness, transfer_id: &str)
 /// A ping/pong proves no binary frame or upload-completion request was sent
 /// on the destination socket before the failure was reported.
 async fn assert_destination_responsive(harness: &mut TransferHarness) -> TestResult {
-    let timestamp = Utc::now();
+    let timestamp = UtcDateTime::now();
     send_agent(&mut harness.destination, &Message::Ping { timestamp }).await?;
     assert!(matches!(
         read_agent(&mut harness.destination).await?,
@@ -363,7 +363,7 @@ async fn multi_chunk_transfer_forwards_exact_binary_and_digest() -> TestResult {
                 Ok(chunk.len() as u64),
             )
             .await?;
-            let timestamp = Utc::now();
+            let timestamp = UtcDateTime::now();
             send_agent(&mut harness.source, &Message::Ping { timestamp }).await?;
             assert!(matches!(
                 read_agent(&mut harness.source).await?,

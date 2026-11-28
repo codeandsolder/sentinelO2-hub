@@ -15,7 +15,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
-use chrono::Utc;
 use clap::Parser;
 use futures_util::{SinkExt as _, StreamExt as _};
 use sentinel0_hub_core::{
@@ -35,6 +34,7 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
+use time::UtcDateTime;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -287,7 +287,7 @@ async fn serve_agent(state: AppState, socket: WebSocket) {
     let (host_id, session_id) = (host.id.clone(), format!("sess_{}", Uuid::now_v7().simple()));
     let welcome = Message::Welcome {
         session_id: session_id.clone(),
-        server_time: Utc::now(),
+        server_time: UtcDateTime::now(),
         heartbeat_interval_seconds: HEARTBEAT_INTERVAL_SECS,
     };
     let Ok(welcome_json) = serde_json::to_string(&welcome) else {

@@ -584,7 +584,7 @@ impl TenantHub {
         ws.serialize_attachment(attachment)?;
         ws.send(&Message::Welcome {
             session_id,
-            server_time: chrono::Utc::now(),
+            server_time: time::UtcDateTime::now(),
             heartbeat_interval_seconds: HEARTBEAT_INTERVAL_SECS,
         })?;
         Ok(())
@@ -612,7 +612,7 @@ impl TenantHub {
                 hostname.into(),
                 agent_version.into(),
                 protocol_version.into(),
-                chrono::Utc::now().timestamp_millis().into(),
+                sentinel0_proto::clock::unix_millis(time::UtcDateTime::now()).into(),
             ],
         )?;
         Ok(())
@@ -621,7 +621,10 @@ impl TenantHub {
     fn mark_disconnected(&self, host_id: &str) -> Result<()> {
         self.state.storage().sql().exec(
             "UPDATE hosts SET last_disconnected_ms = ? WHERE host_id = ?",
-            vec![chrono::Utc::now().timestamp_millis().into(), host_id.into()],
+            vec![
+                sentinel0_proto::clock::unix_millis(time::UtcDateTime::now()).into(),
+                host_id.into(),
+            ],
         )?;
         Ok(())
     }
@@ -642,7 +645,7 @@ impl TenantHub {
                 host_id.into(),
                 connection_id.into(),
                 session_id.into(),
-                chrono::Utc::now().timestamp_millis().into(),
+                sentinel0_proto::clock::unix_millis(time::UtcDateTime::now()).into(),
             ],
         )?;
         Ok(())
@@ -955,7 +958,7 @@ impl TenantHub {
         request_id: &str,
         host_id: &str,
     ) -> Result<Option<Response>> {
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = sentinel0_proto::clock::unix_millis(time::UtcDateTime::now());
         let sql = self.state.storage().sql();
         sql.exec(
             "DELETE FROM idempotency WHERE expires_ms <= ?",
@@ -1118,7 +1121,7 @@ impl TenantHub {
     }
 
     fn mark_running_jobs_orphaned(&self, host_id: &str) -> Result<()> {
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = sentinel0_proto::clock::unix_millis(time::UtcDateTime::now());
         self.state.storage().sql().exec(
             "UPDATE jobs SET status = 'orphaned', updated_ms = ? \
              WHERE host_id = ? AND status = 'running'",
@@ -1128,7 +1131,7 @@ impl TenantHub {
     }
 
     fn persist_job_started(&self, job_id: &str, host_id: &str, tool: &str) -> Result<()> {
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = sentinel0_proto::clock::unix_millis(time::UtcDateTime::now());
         self.state.storage().sql().exec(
             "INSERT INTO jobs (job_id, host_id, tool, status, completion_json, created_ms, updated_ms) \
              VALUES (?, ?, ?, 'running', NULL, ?, ?) ON CONFLICT(job_id) DO NOTHING",
@@ -1160,7 +1163,7 @@ impl TenantHub {
             ));
         }
 
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = sentinel0_proto::clock::unix_millis(time::UtcDateTime::now());
         let completion_json = serde_json::to_string(&completion.data)
             .map_err(|error| Error::RustError(error.to_string()))?;
         let summary_json = serde_json::to_string(&completion.summary())
@@ -1223,7 +1226,7 @@ impl TenantHub {
             )?
             .to_array::<NotificationRow>()?;
         let mut completed = Vec::with_capacity(unread.len());
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = sentinel0_proto::clock::unix_millis(time::UtcDateTime::now());
         for row in unread {
             let summary = serde_json::from_str::<Value>(&row.summary_json)
                 .map_err(|error| Error::RustError(error.to_string()))?;
@@ -1292,7 +1295,7 @@ impl TenantHub {
 
     fn notifications_ack(&self, job_id: Option<&str>) -> Result<Response> {
         let sql = self.state.storage().sql();
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = sentinel0_proto::clock::unix_millis(time::UtcDateTime::now());
         let cursor = match job_id {
             None | Some("all") => sql.exec(
                 "UPDATE notifications SET acked_ms = ? WHERE acked_ms IS NULL",
