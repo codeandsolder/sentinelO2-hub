@@ -22,9 +22,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{cell::RefCell, collections::HashMap, time::Duration};
 use worker::{
-    Context, Date, Delay, DurableObject, Env, Error, Method, Request, Response, Result,
-    SqlStorageValue, State, WebSocket, WebSocketIncomingMessage, WebSocketPair, console_log,
-    console_warn, durable_object, event, wasm_bindgen,
+    Context, Delay, DurableObject, Env, Error, Method, Request, Response, Result, SqlStorageValue,
+    State, WebSocket, WebSocketIncomingMessage, WebSocketPair, console_log, console_warn,
+    durable_object, event, wasm_bindgen,
 };
 
 const TENANT_HUB_BINDING: &str = "TENANT_HUB";
@@ -33,6 +33,10 @@ const AGENT_TOKEN_SECRET: &str = "SENTINEL0_ENROLLMENT_TOKEN";
 const API_TOKEN_SECRET: &str = "SENTINEL0_API_TOKEN";
 const DEFAULT_HOST_KEY: &str = "default_host_id";
 const IDEMPOTENCY_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
+
+fn now_millis() -> i64 {
+    sentinel0_proto::clock::unix_millis(time::UtcDateTime::now())
+}
 
 #[event(fetch, respond_with_errors)]
 /// Route one public Worker request to this deployment's tenant Durable Object.
@@ -574,7 +578,7 @@ impl TenantHub {
             .unwrap_or_else(|| self.next_connection_id());
 
         self.close_superseded_socket(&host.id)?;
-        let session_id = format!("sess_{}_{}", host.id, Date::now().as_millis());
+        let session_id = format!("sess_{}_{}", host.id, now_millis());
         self.persist_hello(&host.id, &host.hostname, &agent_version, &protocol_version)?;
         self.persist_active_session(&host.id, &connection_id, &session_id)?;
 
@@ -612,7 +616,7 @@ impl TenantHub {
                 hostname.into(),
                 agent_version.into(),
                 protocol_version.into(),
-                sentinel0_proto::clock::unix_millis(time::UtcDateTime::now()).into(),
+                now_millis().into(),
             ],
         )?;
         Ok(())
@@ -621,10 +625,7 @@ impl TenantHub {
     fn mark_disconnected(&self, host_id: &str) -> Result<()> {
         self.state.storage().sql().exec(
             "UPDATE hosts SET last_disconnected_ms = ? WHERE host_id = ?",
-            vec![
-                sentinel0_proto::clock::unix_millis(time::UtcDateTime::now()).into(),
-                host_id.into(),
-            ],
+            vec![now_millis().into(), host_id.into()],
         )?;
         Ok(())
     }
@@ -645,7 +646,7 @@ impl TenantHub {
                 host_id.into(),
                 connection_id.into(),
                 session_id.into(),
-                sentinel0_proto::clock::unix_millis(time::UtcDateTime::now()).into(),
+                now_millis().into(),
             ],
         )?;
         Ok(())
@@ -958,7 +959,7 @@ impl TenantHub {
         request_id: &str,
         host_id: &str,
     ) -> Result<Option<Response>> {
-        let now_ms = sentinel0_proto::clock::unix_millis(time::UtcDateTime::now());
+        let now_ms = now_millis();
         let sql = self.state.storage().sql();
         sql.exec(
             "DELETE FROM idempotency WHERE expires_ms <= ?",
@@ -1121,7 +1122,7 @@ impl TenantHub {
     }
 
     fn mark_running_jobs_orphaned(&self, host_id: &str) -> Result<()> {
-        let now_ms = sentinel0_proto::clock::unix_millis(time::UtcDateTime::now());
+        let now_ms = now_millis();
         self.state.storage().sql().exec(
             "UPDATE jobs SET status = 'orphaned', updated_ms = ? \
              WHERE host_id = ? AND status = 'running'",
@@ -1131,7 +1132,7 @@ impl TenantHub {
     }
 
     fn persist_job_started(&self, job_id: &str, host_id: &str, tool: &str) -> Result<()> {
-        let now_ms = sentinel0_proto::clock::unix_millis(time::UtcDateTime::now());
+        let now_ms = now_millis();
         self.state.storage().sql().exec(
             "INSERT INTO jobs (job_id, host_id, tool, status, completion_json, created_ms, updated_ms) \
              VALUES (?, ?, ?, 'running', NULL, ?, ?) ON CONFLICT(job_id) DO NOTHING",
@@ -1163,7 +1164,7 @@ impl TenantHub {
             ));
         }
 
-        let now_ms = sentinel0_proto::clock::unix_millis(time::UtcDateTime::now());
+        let now_ms = now_millis();
         let completion_json = serde_json::to_string(&completion.data)
             .map_err(|error| Error::RustError(error.to_string()))?;
         let summary_json = serde_json::to_string(&completion.summary())
@@ -1226,7 +1227,7 @@ impl TenantHub {
             )?
             .to_array::<NotificationRow>()?;
         let mut completed = Vec::with_capacity(unread.len());
-        let now_ms = sentinel0_proto::clock::unix_millis(time::UtcDateTime::now());
+        let now_ms = now_millis();
         for row in unread {
             let summary = serde_json::from_str::<Value>(&row.summary_json)
                 .map_err(|error| Error::RustError(error.to_string()))?;
@@ -1295,7 +1296,7 @@ impl TenantHub {
 
     fn notifications_ack(&self, job_id: Option<&str>) -> Result<Response> {
         let sql = self.state.storage().sql();
-        let now_ms = sentinel0_proto::clock::unix_millis(time::UtcDateTime::now());
+        let now_ms = now_millis();
         let cursor = match job_id {
             None | Some("all") => sql.exec(
                 "UPDATE notifications SET acked_ms = ? WHERE acked_ms IS NULL",
@@ -1499,19 +1500,19 @@ impl TenantHub {
     fn next_request_id(&self) -> String {
         let mut counter = self.request_counter.borrow_mut();
         *counter = counter.wrapping_add(1);
-        format!("hreq_{}_{}", Date::now().as_millis(), *counter)
+        format!("hreq_{}_{}", now_millis(), *counter)
     }
 
     fn next_job_id(&self) -> String {
         let mut counter = self.request_counter.borrow_mut();
         *counter = counter.wrapping_add(1);
-        format!("job_{:x}_{:x}", Date::now().as_millis(), *counter)
+        format!("job_{:x}_{:x}", now_millis(), *counter)
     }
 
     fn next_connection_id(&self) -> String {
         let mut counter = self.request_counter.borrow_mut();
         *counter = counter.wrapping_add(1);
-        format!("conn_{:x}_{:x}", Date::now().as_millis(), *counter)
+        format!("conn_{:x}_{:x}", now_millis(), *counter)
     }
 }
 
